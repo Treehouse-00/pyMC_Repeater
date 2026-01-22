@@ -307,6 +307,11 @@ EOF
         export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
     fi
     
+    # Install pymc_core dependency first (in case main package metadata fails)
+    echo "Installing pymc_core..."
+    pip install --break-system-packages "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev" 2>/dev/null || \
+        pip install "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev" || true
+    
     if pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || pip install --force-reinstall --no-cache-dir .; then
         echo ""
         echo "✓ Python package installation completed successfully!"
@@ -483,6 +488,11 @@ EOF
         else
             export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
         fi
+        
+        # Install pymc_core dependency first (in case main package metadata fails)
+        echo "Installing pymc_core..."
+        pip install --break-system-packages "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev" 2>/dev/null || \
+            pip install "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev" || true
         
         # Force reinstall the package and all dependencies for clean upgrade
         if pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || pip install --force-reinstall --no-cache-dir .; then
