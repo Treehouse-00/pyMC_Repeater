@@ -202,8 +202,8 @@ install_repeater() {
     
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
-    apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
-    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+    apt-get install -y libffi-dev jq python3-pip python3-rrdtool wget swig build-essential python3-dev
+    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || pip install setuptools_scm >/dev/null 2>&1 || true
     
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -307,7 +307,7 @@ EOF
         export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
     fi
     
-    if pip install --break-system-packages --force-reinstall --no-cache-dir --ignore-installed .; then
+    if pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || pip install --force-reinstall --no-cache-dir .; then
         echo ""
         echo "✓ Python package installation completed successfully!"
         
@@ -382,8 +382,8 @@ upgrade_repeater() {
         echo "[3/9] Updating system dependencies..."
         apt-get update -qq
 
-        apt-get install -y libffi-dev jq pip python3-rrdtool wget swig build-essential python3-dev
-        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || true
+        apt-get install -y libffi-dev jq python3-pip python3-rrdtool wget swig build-essential python3-dev
+        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || pip install setuptools_scm >/dev/null 2>&1 || true
         
         # Install mikefarah yq v4 if not already installed
         if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -485,7 +485,7 @@ EOF
         fi
         
         # Force reinstall the package and all dependencies for clean upgrade
-        if python3 -m pip install --break-system-packages --force-reinstall --no-cache-dir --ignore-installed .; then
+        if pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || pip install --force-reinstall --no-cache-dir .; then
             echo ""
             echo "✓ Package and dependencies updated successfully!"
         else
