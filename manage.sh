@@ -203,7 +203,7 @@ install_repeater() {
     echo "25"; echo "# Installing system dependencies..."
     apt-get update -qq
     apt-get install -y libffi-dev jq python3-pip python3-rrdtool wget swig build-essential python3-dev
-    pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || pip install setuptools_scm >/dev/null 2>&1 || true
+    python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install setuptools_scm >/dev/null 2>&1 || true
     
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -309,10 +309,10 @@ EOF
     
     # Install pymc_core dependency first (in case main package metadata fails)
     echo "Installing pymc_core..."
-    pip install --break-system-packages "pymc_core[hardware]" 2>/dev/null || \
-        pip install "pymc_core[hardware]" || true
+    python3 -m pip install --break-system-packages "pymc_core[hardware]" 2>/dev/null || \
+        python3 -m pip install "pymc_core[hardware]" || true
     
-    if pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || pip install --force-reinstall --no-cache-dir .; then
+    if python3 -m pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || python3 -m pip install --force-reinstall --no-cache-dir .; then
         echo ""
         echo "✓ Python package installation completed successfully!"
         
@@ -388,7 +388,7 @@ upgrade_repeater() {
         apt-get update -qq
 
         apt-get install -y libffi-dev jq python3-pip python3-rrdtool wget swig build-essential python3-dev
-        pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || pip install setuptools_scm >/dev/null 2>&1 || true
+        python3 -m pip install --break-system-packages setuptools_scm >/dev/null 2>&1 || python3 -m pip install setuptools_scm >/dev/null 2>&1 || true
         
         # Install mikefarah yq v4 if not already installed
         if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
@@ -491,11 +491,11 @@ EOF
         
         # Install pymc_core dependency first (in case main package metadata fails)
         echo "Installing pymc_core..."
-        pip install --break-system-packages "pymc_core[hardware]" 2>/dev/null || \
-            pip install "pymc_core[hardware]" || true
+        python3 -m pip install --break-system-packages "pymc_core[hardware]" 2>/dev/null || \
+            python3 -m pip install "pymc_core[hardware]" || true
         
         # Force reinstall the package and all dependencies for clean upgrade
-        if pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || pip install --force-reinstall --no-cache-dir .; then
+        if python3 -m pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || python3 -m pip install --force-reinstall --no-cache-dir .; then
             echo ""
             echo "✓ Package and dependencies updated successfully!"
         else
