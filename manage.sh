@@ -312,9 +312,9 @@ EOF
     DEPS=$(grep -A20 "^dependencies" pyproject.toml | grep '"' | sed 's/.*"\(.*\)".*/\1/' | grep -v "@" | tr '\n' ' ')
     python3 -m pip install --break-system-packages pymc_core $DEPS 2>/dev/null || \
         python3 -m pip install pymc_core $DEPS
-    # Install hardware dependencies
-    python3 -m pip install --break-system-packages spidev python-periphery pyserial gpiod 2>/dev/null || \
-        python3 -m pip install spidev python-periphery pyserial gpiod
+    # Install hardware dependencies (spidev needs --no-binary to compile for correct Python)
+    python3 -m pip install --break-system-packages --no-binary spidev spidev python-periphery pyserial gpiod 2>/dev/null || \
+        python3 -m pip install --no-binary spidev spidev python-periphery pyserial gpiod
     
     if python3 -m pip install --break-system-packages --no-deps --no-cache-dir . 2>/dev/null || python3 -m pip install --no-deps --no-cache-dir .; then
         echo ""
@@ -498,9 +498,9 @@ EOF
         DEPS=$(grep -A20 "^dependencies" pyproject.toml | grep '"' | sed 's/.*"\(.*\)".*/\1/' | grep -v "@" | tr '\n' ' ')
         python3 -m pip install --break-system-packages pymc_core $DEPS 2>/dev/null || \
             python3 -m pip install pymc_core $DEPS
-        # Install hardware dependencies
-        python3 -m pip install --break-system-packages spidev python-periphery pyserial gpiod 2>/dev/null || \
-            python3 -m pip install spidev python-periphery pyserial gpiod
+        # Install hardware dependencies (spidev needs --no-binary to compile for correct Python)
+        python3 -m pip install --break-system-packages --no-binary spidev spidev python-periphery pyserial gpiod 2>/dev/null || \
+            python3 -m pip install --no-binary spidev spidev python-periphery pyserial gpiod
         
         # Install the main package
         if python3 -m pip install --break-system-packages --no-deps --no-cache-dir . 2>/dev/null || python3 -m pip install --no-deps --no-cache-dir .; then
