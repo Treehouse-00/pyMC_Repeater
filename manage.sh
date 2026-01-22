@@ -309,8 +309,8 @@ EOF
     
     # Install pymc_core dependency first (in case main package metadata fails)
     echo "Installing pymc_core..."
-    pip install --break-system-packages "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev" 2>/dev/null || \
-        pip install "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev" || true
+    pip install --break-system-packages "pymc_core[hardware]" 2>/dev/null || \
+        pip install "pymc_core[hardware]" || true
     
     if pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || pip install --force-reinstall --no-cache-dir .; then
         echo ""
@@ -491,8 +491,8 @@ EOF
         
         # Install pymc_core dependency first (in case main package metadata fails)
         echo "Installing pymc_core..."
-        pip install --break-system-packages "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev" 2>/dev/null || \
-            pip install "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@dev" || true
+        pip install --break-system-packages "pymc_core[hardware]" 2>/dev/null || \
+            pip install "pymc_core[hardware]" || true
         
         # Force reinstall the package and all dependencies for clean upgrade
         if pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || pip install --force-reinstall --no-cache-dir .; then
