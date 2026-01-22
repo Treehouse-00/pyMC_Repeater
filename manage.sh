@@ -167,27 +167,18 @@ install_repeater() {
     fi
     
     # Welcome screen
-    $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your Raspberry Pi as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
+    $DIALOG --backtitle "pyMC Repeater Management" --title "Welcome" --msgbox "\nWelcome to pyMC Repeater Setup\n\nThis installer will configure your device as a LoRa mesh network repeater.\n\nPress OK to continue..." 12 70
     
-    # SPI Check
-    CONFIG_FILE=""
-    if [ -f "/boot/firmware/config.txt" ]; then
-        CONFIG_FILE="/boot/firmware/config.txt"
-    elif [ -f "/boot/config.txt" ]; then
-        CONFIG_FILE="/boot/config.txt"
-    fi
-    
-    if [ -n "$CONFIG_FILE" ] && ! grep -q "dtparam=spi=on" "$CONFIG_FILE" 2>/dev/null && ! grep -q "spi_bcm2835" /proc/modules 2>/dev/null; then
-        if ask_yes_no "SPI Not Enabled" "\nSPI interface is required but not enabled!\n\nWould you like to enable it now?\n(This will require a reboot)"; then
-            echo "dtparam=spi=on" >> "$CONFIG_FILE"
-            show_info "SPI Enabled" "\nSPI has been enabled in $CONFIG_FILE\n\nSystem will reboot now. Please run this script again after reboot."
-            reboot
+    # SPI Check - just verify SPI is available
+    if [ ! -e /dev/spidev0.0 ] && [ ! -e /dev/spidev1.0 ]; then
+        # Provide platform-specific hints
+        if [ -f "/boot/firmware/config.txt" ] || [ -f "/boot/config.txt" ]; then
+            show_error "SPI not enabled!\n\nPlease run: sudo raspi-config\n-> Interface Options -> SPI -> Enable\n\nThen reboot and run this script again."
+        elif command -v luckfox-config &> /dev/null; then
+            show_error "SPI not enabled!\n\nPlease run: sudo luckfox-config\n-> Advanced Options -> SPI interface -> Enable\n\nThen reboot and run this script again."
         else
-            show_error "SPI is required for LoRa radio operation.\n\nPlease enable SPI manually and run this script again."
-            return
+            show_error "SPI not available.\n\nPlease enable SPI for your device and run this script again."
         fi
-    elif [ -z "$CONFIG_FILE" ]; then
-        show_error "Could not find config.txt file.\n\nPlease enable SPI manually:\nsudo raspi-config -> Interfacing Options -> SPI -> Enable"
         return
     fi
     
@@ -202,8 +193,9 @@ install_repeater() {
     fi
     
     echo "10"; echo "# Adding user to hardware groups..."
-    usermod -a -G gpio,i2c,spi "$SERVICE_USER" 2>/dev/null || true
-    usermod -a -G dialout "$SERVICE_USER" 2>/dev/null || true
+    for grp in gpio i2c spi dialout; do
+        getent group "$grp" >/dev/null 2>&1 && usermod -a -G "$grp" "$SERVICE_USER" 2>/dev/null || true
+    done
     
     echo "20"; echo "# Creating directories..."
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" /var/lib/pymc_repeater
@@ -216,12 +208,13 @@ install_repeater() {
     # Install mikefarah yq v4 if not already installed
     if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
         YQ_VERSION="v4.40.5"
-        YQ_BINARY="yq_linux_arm64"
-        if [[ "$(uname -m)" == "x86_64" ]]; then
-            YQ_BINARY="yq_linux_amd64"
-        elif [[ "$(uname -m)" == "armv7"* ]]; then
-            YQ_BINARY="yq_linux_arm"
-        fi
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+            x86_64)       YQ_BINARY="yq_linux_amd64" ;;
+            aarch64|arm64) YQ_BINARY="yq_linux_arm64" ;;
+            armv7*|armhf) YQ_BINARY="yq_linux_arm" ;;
+            *)            YQ_BINARY="yq_linux_arm64" ;;  # fallback
+        esac
         wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
     fi
     
@@ -395,12 +388,13 @@ upgrade_repeater() {
         # Install mikefarah yq v4 if not already installed
         if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
             YQ_VERSION="v4.40.5"
-            YQ_BINARY="yq_linux_arm64"
-            if [[ "$(uname -m)" == "x86_64" ]]; then
-                YQ_BINARY="yq_linux_amd64"
-            elif [[ "$(uname -m)" == "armv7"* ]]; then
-                YQ_BINARY="yq_linux_arm"
-            fi
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+                x86_64)       YQ_BINARY="yq_linux_amd64" ;;
+                aarch64|arm64) YQ_BINARY="yq_linux_arm64" ;;
+                armv7*|armhf) YQ_BINARY="yq_linux_arm" ;;
+                *)            YQ_BINARY="yq_linux_arm64" ;;  # fallback
+            esac
             wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
         fi
         echo "    ✓ Dependencies updated"
@@ -667,10 +661,10 @@ show_detailed_status() {
         # Add system info
         status_info="${status_info}System Info:\n"
         status_info="${status_info}- SPI: "
-        if grep -q "spi_bcm2835" /proc/modules 2>/dev/null; then
-            status_info="${status_info}Enabled ✓\n"
+        if [ -e /dev/spidev0.0 ] || [ -e /dev/spidev1.0 ]; then
+            status_info="${status_info}Available ✓\n"
         else
-            status_info="${status_info}Disabled ✗\n"
+            status_info="${status_info}Not available ✗\n"
         fi
         
         status_info="${status_info}- IP Address: $ip_address\n"
