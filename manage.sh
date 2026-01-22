@@ -193,12 +193,16 @@ install_repeater() {
     fi
     
     echo "10"; echo "# Adding user to hardware groups..."
+    # Create groups if they don't exist
+    getent group gpio >/dev/null 2>&1 || groupadd gpio
+    getent group spi >/dev/null 2>&1 || groupadd spi
     for grp in gpio i2c spi dialout; do
         getent group "$grp" >/dev/null 2>&1 && usermod -a -G "$grp" "$SERVICE_USER" 2>/dev/null || true
     done
     
-    # Create udev rule for GPIO access
+    # Create udev rules for GPIO and SPI access
     echo 'SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"' > /etc/udev/rules.d/99-gpio.rules
+    echo 'SUBSYSTEM=="spidev", GROUP="spi", MODE="0660"' > /etc/udev/rules.d/99-spi.rules
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger 2>/dev/null || true
     
