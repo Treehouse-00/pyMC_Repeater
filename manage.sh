@@ -307,12 +307,13 @@ EOF
         export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
     fi
     
-    # Install pymc_core dependency first (in case main package metadata fails)
-    echo "Installing pymc_core..."
-    python3 -m pip install --break-system-packages "pymc_core[hardware]" 2>/dev/null || \
-        python3 -m pip install "pymc_core[hardware]" || true
+    # Install dependencies from pyproject.toml (use PyPI pymc_core, skip git URLs)
+    echo "Installing dependencies..."
+    DEPS=$(grep -A20 "^dependencies" pyproject.toml | grep '"' | sed 's/.*"\(.*\)".*/\1/' | grep -v "@" | tr '\n' ' ')
+    python3 -m pip install --break-system-packages "pymc_core[hardware]" $DEPS 2>/dev/null || \
+        python3 -m pip install "pymc_core[hardware]" $DEPS
     
-    if python3 -m pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || python3 -m pip install --force-reinstall --no-cache-dir .; then
+    if python3 -m pip install --break-system-packages --no-deps --no-cache-dir . 2>/dev/null || python3 -m pip install --no-deps --no-cache-dir .; then
         echo ""
         echo "✓ Python package installation completed successfully!"
         
@@ -489,13 +490,14 @@ EOF
             export SETUPTOOLS_SCM_PRETEND_VERSION="1.0.5"
         fi
         
-        # Install pymc_core dependency first (in case main package metadata fails)
-        echo "Installing pymc_core..."
-        python3 -m pip install --break-system-packages "pymc_core[hardware]" 2>/dev/null || \
-            python3 -m pip install "pymc_core[hardware]" || true
+        # Install dependencies from pyproject.toml (use PyPI pymc_core, skip git URLs)
+        echo "Installing dependencies..."
+        DEPS=$(grep -A20 "^dependencies" pyproject.toml | grep '"' | sed 's/.*"\(.*\)".*/\1/' | grep -v "@" | tr '\n' ' ')
+        python3 -m pip install --break-system-packages "pymc_core[hardware]" $DEPS 2>/dev/null || \
+            python3 -m pip install "pymc_core[hardware]" $DEPS
         
-        # Force reinstall the package and all dependencies for clean upgrade
-        if python3 -m pip install --break-system-packages --force-reinstall --no-cache-dir . 2>/dev/null || python3 -m pip install --force-reinstall --no-cache-dir .; then
+        # Install the main package
+        if python3 -m pip install --break-system-packages --no-deps --no-cache-dir . 2>/dev/null || python3 -m pip install --no-deps --no-cache-dir .; then
             echo ""
             echo "✓ Package and dependencies updated successfully!"
         else
