@@ -1,5 +1,6 @@
 import json
 import logging
+import mimetypes
 import os
 import queue
 import re
@@ -12,6 +13,7 @@ from typing import Callable, Optional
 
 import cherrypy
 import cherrypy_cors
+from cherrypy.lib import static as cherrypy_static
 
 from repeater.config import resolve_storage_dir
 from repeater.data_acquisition import SQLiteHandler
@@ -39,6 +41,80 @@ except ImportError:
     logger.warning("ws4py not available - WebSocket support disabled")
 
 logger = logging.getLogger("HTTPServer")
+
+_HASHED_ASSET_RE = re.compile(r"(?:^|-)[A-Za-z0-9_-]{8}(?=(?:\.[A-Za-z0-9]+){1,3}$)")
+_PRECOMPRESSED_SUFFIXES = frozenset({".br", ".gz"})
+_IMMUTABLE_ASSET_CACHE = "public, max-age=31536000, immutable"
+
+
+def _append_vary(headers, value: str) -> None:
+    values = [item.strip() for item in headers.get("Vary", "").split(",") if item.strip()]
+    if value.lower() not in {item.lower() for item in values}:
+        values.append(value)
+    headers["Vary"] = ", ".join(values)
+
+
+def _encoding_quality(accept_encoding: str, encoding: str) -> float:
+    """Return the RFC-style quality for one content encoding."""
+
+    explicit_quality = None
+    wildcard_quality = None
+    for item in accept_encoding.split(","):
+        parts = [part.strip() for part in item.split(";") if part.strip()]
+        if not parts:
+            continue
+        name = parts[0].lower()
+        quality = 1.0
+        for parameter in parts[1:]:
+            key, separator, value = parameter.partition("=")
+            if separator and key.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        quality = min(1.0, max(0.0, quality))
+        if name == encoding:
+            explicit_quality = max(explicit_quality or 0.0, quality)
+        elif name == "*":
+            wildcard_quality = max(wildcard_quality or 0.0, quality)
+
+    if explicit_quality is not None:
+        return explicit_quality
+    return wildcard_quality or 0.0
+
+
+def _select_precompressed_file(
+    target: Path,
+    static_root: Path,
+    accept_encoding: str,
+) -> tuple[Path, Optional[str]]:
+    """Select an existing sidecar for a logical asset without reinterpreting sidecar URLs."""
+
+    if target.suffix.lower() in _PRECOMPRESSED_SUFFIXES:
+        return target, None
+
+    candidates = []
+    for encoding, suffix, preference in (("br", ".br", 1), ("gzip", ".gz", 0)):
+        quality = _encoding_quality(accept_encoding, encoding)
+        sidecar = target.with_name(f"{target.name}{suffix}").resolve()
+        try:
+            sidecar.relative_to(static_root)
+        except ValueError:
+            continue
+        if quality > 0 and sidecar.is_file():
+            candidates.append((quality, preference, sidecar, encoding))
+
+    if not candidates:
+        return target, None
+    _, _, selected, encoding = max(candidates, key=lambda item: (item[0], item[1]))
+    return selected, encoding
+
+
+def _apply_static_cache_policy(headers, target: Path) -> None:
+    if target.suffix.lower() in {".html", ".htm"}:
+        headers["Cache-Control"] = "no-cache"
+    elif _HASHED_ASSET_RE.search(target.name):
+        headers["Cache-Control"] = _IMMUTABLE_ASSET_CACHE
 
 
 # In-memory log buffer
@@ -204,12 +280,14 @@ class StatsApp:
         self.pub_key = pub_key
         self.dashboard_template = None
         self.config = config or {}
+        self.default_html_dir = os.path.join(os.path.dirname(__file__), "html")
 
         # Path to the compiled Vue.js application
         # Use web_path from config if provided, otherwise use default
-        default_html_dir = os.path.join(os.path.dirname(__file__), "html")
         web_path = self.config.get("web", {}).get("web_path")
-        self.html_dir = web_path if web_path is not None else default_html_dir
+        self.html_dir = (
+            web_path if web_path is not None and os.path.isdir(web_path) else self.default_html_dir
+        )
 
         # Create nested API object for routing
         self.api = APIEndpoints(
@@ -219,12 +297,63 @@ class StatsApp:
         # Create doc endpoint for API documentation
         self.doc = DocEndpoint(self.api)
 
+    def _resolve_html_dir(self) -> str:
+        web_path = self.config.get("web", {}).get("web_path")
+        candidate = (
+            web_path if web_path is not None and os.path.isdir(web_path) else self.default_html_dir
+        )
+        self.html_dir = candidate
+        return candidate
+
+    def apply_web_config(self) -> bool:
+        previous = self.html_dir
+        current = self._resolve_html_dir()
+        return previous != current
+
+    def _serve_static_file(self, root_dir: str, relative_parts: tuple[str, ...]):
+        if not relative_parts:
+            raise cherrypy.NotFound()
+        root = Path(root_dir).resolve()
+        target = (root.joinpath(*relative_parts)).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise cherrypy.NotFound()
+        if not target.is_file():
+            raise cherrypy.NotFound()
+
+        request_headers = getattr(cherrypy.request, "headers", {})
+        selected, content_encoding = _select_precompressed_file(
+            target,
+            root,
+            request_headers.get("Accept-Encoding", ""),
+        )
+        guessed_type, _ = mimetypes.guess_type(str(target))
+        response_headers = cherrypy.response.headers
+        _append_vary(response_headers, "Accept-Encoding")
+        _apply_static_cache_policy(response_headers, target)
+        if content_encoding is not None:
+            response_headers["Content-Encoding"] = content_encoding
+        return cherrypy_static.serve_file(
+            str(selected),
+            content_type=guessed_type or "application/octet-stream",
+        )
+
+    @cherrypy.expose
+    def favicon_ico(self):
+        """Serve the favicon bundled with the compiled frontend."""
+        self._resolve_html_dir()
+        return self._serve_static_file(self.html_dir, ("favicon.ico",))
+
     @cherrypy.expose
     def index(self, **kwargs):
         """Serve the Vue.js application index.html."""
+        self._resolve_html_dir()
         index_path = os.path.join(self.html_dir, "index.html")
         try:
             with open(index_path, "r", encoding="utf-8") as f:
+                cherrypy.response.headers["Cache-Control"] = "no-cache"
+                cherrypy.response.headers["Content-Type"] = "text/html; charset=utf-8"
                 return f.read()
         except FileNotFoundError:
             raise cherrypy.HTTPError(404, "Application not found. Please build the frontend first.")
@@ -235,6 +364,7 @@ class StatsApp:
     @cherrypy.expose
     def default(self, *args, **kwargs):
         """Handle client-side routing - serve index.html for all non-API routes."""
+        self._resolve_html_dir()
         # Handle OPTIONS requests for any path
         if cherrypy.request.method == "OPTIONS":
             return ""
@@ -252,6 +382,16 @@ class StatsApp:
         ):
             # WebSocket tool will intercept this
             return ""
+
+        # Serve frontend static assets dynamically from the active html_dir.
+        if args and args[0] == "assets":
+            return self._serve_static_file(os.path.join(self.html_dir, "assets"), tuple(args[1:]))
+
+        if args and args[0] == "_next":
+            return self._serve_static_file(os.path.join(self.html_dir, "_next"), tuple(args[1:]))
+
+        if args and args[0] == "favicon.ico":
+            return self._serve_static_file(self.html_dir, ("favicon.ico",))
 
         # For all other routes, serve the Vue.js app (client-side routing)
         return self.index()
@@ -376,12 +516,7 @@ class HTTPStatsServer:
             if self._cors_enabled:
                 self._setup_server_cors()
 
-            default_html_dir = os.path.join(os.path.dirname(__file__), "html")
-            web_path = self.config.get("web", {}).get("web_path")
-            html_dir = web_path if web_path is not None else default_html_dir
-
-            assets_dir = os.path.join(html_dir, "assets")
-            next_dir = os.path.join(html_dir, "_next")
+            self.app.apply_web_config()
 
             # Build config with conditional CORS settings
             config = {
@@ -434,10 +569,6 @@ class HTTPStatsServer:
                 "/api/setup_wizard": {
                     "tools.require_auth.on": False,
                 },
-                "/favicon.ico": {
-                    "tools.staticfile.on": True,
-                    "tools.staticfile.filename": os.path.join(html_dir, "favicon.ico"),
-                },
             }
 
             # Add WebSocket configuration to main config if available
@@ -488,40 +619,6 @@ class HTTPStatsServer:
                 # Apply CORS to paths
                 config["/"].update(cors_config)
                 config["/api"].update(cors_config)
-
-            # Add Vue.js assets support only if assets directory exists
-            if os.path.isdir(assets_dir):
-                config["/assets"] = {
-                    "tools.staticdir.on": True,
-                    "tools.staticdir.dir": assets_dir,
-                    # Set proper content types for assets
-                    "tools.staticdir.content_types": {
-                        "js": "application/javascript",
-                        "css": "text/css",
-                        "map": "application/json",
-                    },
-                }
-
-            # Add Next.js support only if _next directory exists
-            if os.path.isdir(next_dir):
-                config["/_next"] = {
-                    "tools.staticdir.on": True,
-                    "tools.staticdir.dir": next_dir,
-                    # Set proper content types for Next.js assets
-                    "tools.staticdir.content_types": {
-                        "js": "application/javascript",
-                        "css": "text/css",
-                        "map": "application/json",
-                    },
-                }
-
-            # Only add CORS to static assets if CORS is enabled
-            if self._cors_enabled:
-                if "/assets" in config:
-                    config["/assets"]["cors.expose.on"] = True
-                if "/_next" in config:
-                    config["/_next"]["cors.expose.on"] = True
-                config["/favicon.ico"]["cors.expose.on"] = True
 
             http_cfg = self.config.get("http", {}) if isinstance(self.config, dict) else {}
             thread_pool = max(2, int(http_cfg.get("thread_pool", 8)))
