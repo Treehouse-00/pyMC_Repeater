@@ -69,6 +69,7 @@ from repeater.companion.bridge import (
     ChannelTextCapacityError,
     PUBLIC_PREF_FIELDS,
     channel_text_capacity,
+    normalize_region_name,
     outbound_message_id,
     outbound_message_source,
 )
@@ -661,6 +662,10 @@ class CompanionsV1:
                 cherrypy.request.params["companion_name"] = name
                 return getattr(self, action)
         elif len(vpath) == 3:
+            if vpath[1:] == ["messages", "scoped"]:
+                cherrypy.request.params["companion_name"] = vpath[0]
+                vpath.clear()
+                return self.scoped_messages
             # /companions/{name}/contacts/{pubkey} and
             # /companions/{name}/channels/{index} — collection *members*,
             # not the {pubkey}/{action} sub-resources handled below.
@@ -1936,6 +1941,19 @@ class CompanionsV1:
         cherrypy.response.headers["Allow"] = "GET, POST"
         raise cherrypy.HTTPError(405, "Method not allowed. Use GET or POST.")
 
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def scoped_messages(self, companion_name=None):
+        """Probe or send with a per-message region; never change shared preferences."""
+        if cherrypy.request.method == "GET":
+            bridge, _ = self._resolve(companion_name)
+            return self._success({"supported": True, "public_key": bridge.get_public_key().hex()})
+        if cherrypy.request.method == "POST":
+            return self._send_message(companion_name, scoped=True)
+        cherrypy.response.headers["Allow"] = "GET, POST"
+        raise cherrypy.HTTPError(405, "Method not allowed. Use GET or POST.")
+
     def _message_history(self, companion_name, before_id, limit):
         _bridge, companion_hash = self._resolve(companion_name)
         handler = self._get_sqlite_handler()
@@ -1957,7 +1975,7 @@ class CompanionsV1:
         messages = [self._message_to_wire(message) for message in rows]
         return self._success({"messages": messages, "next_before_id": next_before_id})
 
-    def _send_message(self, companion_name):
+    def _send_message(self, companion_name, *, scoped=False):
         """POST /api/v1/companions/{name}/messages — send a DM or channel
         message (§7.3): bridge calls mirror companion_endpoints.send_text /
         send_channel_message exactly. Wrapped with the mandatory
@@ -1992,13 +2010,24 @@ class CompanionsV1:
             )
 
         body = self._get_json_body()
-        reject_unknown_fields(body, {"to", "channel_idx", "text", "txt_type"})
+        allowed_fields = {"to", "channel_idx", "text", "txt_type"}
+        if scoped:
+            allowed_fields.add("region")
+        reject_unknown_fields(body, allowed_fields)
+        region = None
+        if scoped:
+            try:
+                region = normalize_region_name(body.get("region"))
+            except ValueError as exc:
+                raise cherrypy.HTTPError(400, str(exc)) from exc
         to_hex = body.get("to")
         channel_idx = body.get("channel_idx")
         has_to = to_hex is not None
         has_channel = channel_idx is not None  # 0 is a valid channel index
         if has_to == has_channel:
             raise cherrypy.HTTPError(400, "Exactly one of 'to' or 'channel_idx' required")
+        if scoped and not has_channel:
+            raise cherrypy.HTTPError(400, "Region overrides require a channel message")
         text = text_field(body, "text", required=True, max_bytes=MAX_TEXT_LEN)
         if "\x00" in text:
             # MeshCore text payloads are C strings. Accepting an embedded NUL
@@ -2030,6 +2059,8 @@ class CompanionsV1:
                     f"text exceeds {channel_text_max} UTF-8 bytes for this channel sender name",
                 )
             target = {"channel_idx": idx}
+            if scoped:
+                target["region"] = region
 
         canonical_request = {
             "companion_identity": bridge.get_public_key().hex(),
@@ -2114,7 +2145,9 @@ class CompanionsV1:
             else:
                 bridge_result = self._run_async(
                     _send_and_capture(
-                        lambda: bridge.send_channel_message(idx, text),
+                        lambda: bridge.send_channel_message(
+                            idx, text, **({"region": region} if scoped else {})
+                        ),
                         capture=send_capture,
                         message_id=message_id,
                     )
@@ -2384,9 +2417,7 @@ class CompanionsV1:
             "failed",
         }:
             try:
-                recovered_response = parse_companion_send_response(
-                    persisted["response_json"]
-                )
+                recovered_response = parse_companion_send_response(persisted["response_json"])
             except (KeyError, TypeError, ValueError, RecursionError) as exc:
                 logger.error(
                     "Committed send response is unavailable for message %s: %s",

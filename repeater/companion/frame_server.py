@@ -21,9 +21,11 @@ from typing import Optional
 from openhop_core.companion.constants import (
     ERR_CODE_FILE_IO_ERROR,
     ERR_CODE_ILLEGAL_ARG,
+    ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
     ERR_CODE_UNSUPPORTED_CMD,
     MAX_PATH_SIZE,
+    MAX_FRAME_SIZE,
     MAX_PENDING_ACK_CRCS,
     PUB_KEY_SIZE,
     PUSH_CODE_PATH_UPDATED,
@@ -33,6 +35,7 @@ from openhop_core.companion.frame_server import CompanionFrameServer as _BaseFra
 from openhop_core.companion.models import QueuedMessage
 from openhop_core.protocol.packet_utils import PathUtils
 
+from repeater.companion.bridge import normalize_region_name
 from repeater.companion.inbound_history import (
     persist_inbound_message,
     remove_queue_entry,
@@ -252,11 +255,7 @@ class CompanionFrameServer(_BaseFrameServer):
         # When a tag collides with an older request, retain whichever response
         # window ends later. That keeps both possible late replies quarantined.
         if previous_deadline is not None:
-            deadline = (
-                previous_deadline
-                if deadline is None
-                else max(previous_deadline, deadline)
-            )
+            deadline = previous_deadline if deadline is None else max(previous_deadline, deadline)
         if deadline is not None:
             deadlines[key] = deadline
         while len(owners) > MAX_PENDING_ACK_CRCS:
@@ -425,10 +424,7 @@ class CompanionFrameServer(_BaseFrameServer):
     def _enqueue_frame(self, data: bytes) -> None:
         """Keep command-derived frames on the client session that requested them."""
         session = _frame_command_session.get()
-        if (
-            session is not None
-            and session is not getattr(self, "_active_client_session", None)
-        ):
+        if session is not None and session is not getattr(self, "_active_client_session", None):
             logger.debug(
                 "Companion %s: dropping response for a superseded Frame session",
                 self.companion_hash,
@@ -470,9 +466,7 @@ class CompanionFrameServer(_BaseFrameServer):
             "consume_prefs_save_error",
             None,
         )
-        prefs_error = (
-            consume_prefs_error() if callable(consume_prefs_error) else None
-        )
+        prefs_error = consume_prefs_error() if callable(consume_prefs_error) else None
         if prefs_error is not None:
             logger.warning(
                 "Companion %s preference command rolled back: %s",
@@ -510,18 +504,13 @@ class CompanionFrameServer(_BaseFrameServer):
         async with self._session_guard():
             if getattr(self, "_frame_stopping", False):
                 logger.debug(
-                    "Ignoring companion command while frame server is stopping "
-                    "(port=%s)",
+                    "Ignoring companion command while frame server is stopping (port=%s)",
                     self.port,
                 )
                 return
-            if (
-                session is not None
-                and session is not getattr(self, "_active_client_session", None)
-            ):
+            if session is not None and session is not getattr(self, "_active_client_session", None):
                 logger.debug(
-                    "Ignoring command from superseded companion client "
-                    "(port=%s)",
+                    "Ignoring command from superseded companion client (port=%s)",
                     self.port,
                 )
                 return
@@ -600,9 +589,7 @@ class CompanionFrameServer(_BaseFrameServer):
             if outcome and outcome[0] is not False:
                 self._command_persistence_committed = True
             elif outcome:
-                self._command_persistence_error = RuntimeError(
-                    "storage rejected the write"
-                )
+                self._command_persistence_error = RuntimeError("storage rejected the write")
             raise
         except BaseException as exc:
             self._command_persistence_error = exc
@@ -647,9 +634,7 @@ class CompanionFrameServer(_BaseFrameServer):
         callbacks_by_event = getattr(self.bridge, "_push_callbacks", {})
         for callbacks in callbacks_by_event.values():
             frame_callbacks = [
-                callback
-                for callback in callbacks
-                if getattr(callback, "__self__", None) is self
+                callback for callback in callbacks if getattr(callback, "__self__", None) is self
             ]
             if not frame_callbacks:
                 continue
@@ -805,10 +790,7 @@ class CompanionFrameServer(_BaseFrameServer):
         if contact is None:
             return
         if change == "path":
-            self._enqueue_frame(
-                bytes([PUSH_CODE_PATH_UPDATED])
-                + public_key[:PUB_KEY_SIZE]
-            )
+            self._enqueue_frame(bytes([PUSH_CODE_PATH_UPDATED]) + public_key[:PUB_KEY_SIZE])
             return
         await super()._on_node_discovered(contact)
 
@@ -1164,6 +1146,50 @@ class CompanionFrameServer(_BaseFrameServer):
 
     async def _cmd_send_channel_txt_msg(self, data: bytes) -> None:
         await self._await_committed_state()
+        if data and data[0] == 0x81:
+            # A distinct response cannot be confused with an ordinary send's OK.
+            if data != b"\x81\x00\x00\x00\x00\x00":
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            public_key = self.bridge.get_public_key()
+            if len(public_key) != PUB_KEY_SIZE:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            self._write_frame(b"\xf0OHREG1" + public_key)
+            return
+        if data and data[0] == 0x80:
+            # Count the command byte as part of the upstream Frame payload cap.
+            if len(data) < 9 or len(data) + 1 > MAX_FRAME_SIZE:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            channel_idx = data[1]
+            timestamp = struct.unpack("<I", data[2:6])[0]
+            region_length = data[6]
+            if not 1 <= region_length <= 30 or len(data) <= 7 + region_length:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            try:
+                region = data[7 : 7 + region_length].decode("ascii")
+                if normalize_region_name(region) != region:
+                    raise ValueError("wire region must be canonical")
+                text = data[7 + region_length :].decode("utf-8")
+                if not text.strip() or "\x00" in text:
+                    raise ValueError("invalid channel text")
+            except ValueError:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            if self.bridge.get_channel(channel_idx) is None:
+                self._write_err(ERR_CODE_NOT_FOUND)
+                return
+            try:
+                ok = await self.bridge.send_channel_message(
+                    channel_idx, text, timestamp=timestamp, region=region
+                )
+            except ValueError:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            self._write_ok() if ok else self._write_err(ERR_CODE_NOT_FOUND)
+            return
         await super()._cmd_send_channel_txt_msg(data)
 
     async def _cmd_send_channel_data(self, data: bytes) -> None:
@@ -1204,10 +1230,7 @@ class CompanionFrameServer(_BaseFrameServer):
         flags = data[8]
         path_bytes = data[9:]
         hash_width = PathUtils.trace_payload_hash_width(flags)
-        if (
-            len(path_bytes) % hash_width != 0
-            or len(path_bytes) // hash_width > MAX_PATH_SIZE
-        ):
+        if len(path_bytes) % hash_width != 0 or len(path_bytes) // hash_width > MAX_PATH_SIZE:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         send_raw = getattr(self.bridge, "send_trace_path_raw", None)
@@ -1403,11 +1426,7 @@ class CompanionFrameServer(_BaseFrameServer):
         if not callable(notify):
             return
         if change is None:
-            change = (
-                "remove"
-                if after is None
-                else ("new" if before is None else "update")
-            )
+            change = "remove" if after is None else ("new" if before is None else "update")
         await notify("contact_changed", change, after if after is not None else before)
 
     async def _cmd_add_update_contact(self, data: bytes) -> None:
@@ -1419,9 +1438,7 @@ class CompanionFrameServer(_BaseFrameServer):
         public_key = data[:32] if len(data) >= 32 else b""
         before = self._contact_state(public_key) if public_key else None
         before_contact = (
-            copy.deepcopy(self.bridge.get_contact_by_key(public_key))
-            if public_key
-            else None
+            copy.deepcopy(self.bridge.get_contact_by_key(public_key)) if public_key else None
         )
         self._begin_durable_command()
         self._contact_command_key = public_key or None
@@ -1433,17 +1450,11 @@ class CompanionFrameServer(_BaseFrameServer):
                 self._contact_command_key = None
                 self._contact_command_before = None
         except BaseException:
-            if (
-                public_key
-                and not getattr(self, "_command_persistence_committed", False)
-            ):
+            if public_key and not getattr(self, "_command_persistence_committed", False):
                 self._restore_contact(public_key, before_contact)
             self._clear_durable_command()
             raise
-        if (
-            getattr(self, "_command_persistence_error", None) is not None
-            and public_key
-        ):
+        if getattr(self, "_command_persistence_error", None) is not None and public_key:
             self._restore_contact(public_key, before_contact)
         committed = self._finish_durable_command()
         if committed and public_key:
@@ -1458,9 +1469,7 @@ class CompanionFrameServer(_BaseFrameServer):
         public_key = data[:32] if len(data) >= 32 else b""
         before = self._contact_state(public_key) if public_key else None
         before_contact = (
-            copy.deepcopy(self.bridge.get_contact_by_key(public_key))
-            if public_key
-            else None
+            copy.deepcopy(self.bridge.get_contact_by_key(public_key)) if public_key else None
         )
         self._begin_durable_command()
         self._contact_command_key = public_key or None
@@ -1472,17 +1481,11 @@ class CompanionFrameServer(_BaseFrameServer):
                 self._contact_command_key = None
                 self._contact_command_before = None
         except BaseException:
-            if (
-                public_key
-                and not getattr(self, "_command_persistence_committed", False)
-            ):
+            if public_key and not getattr(self, "_command_persistence_committed", False):
                 self._restore_contact(public_key, before_contact)
             self._clear_durable_command()
             raise
-        if (
-            getattr(self, "_command_persistence_error", None) is not None
-            and public_key
-        ):
+        if getattr(self, "_command_persistence_error", None) is not None and public_key:
             self._restore_contact(public_key, before_contact)
         committed = self._finish_durable_command()
         if committed and public_key:
@@ -1497,9 +1500,7 @@ class CompanionFrameServer(_BaseFrameServer):
         public_key = data[:32] if len(data) >= 32 else b""
         before = self._contact_state(public_key) if public_key else None
         before_contact = (
-            copy.deepcopy(self.bridge.get_contact_by_key(public_key))
-            if public_key
-            else None
+            copy.deepcopy(self.bridge.get_contact_by_key(public_key)) if public_key else None
         )
         self._begin_durable_command()
         try:
@@ -1528,17 +1529,11 @@ class CompanionFrameServer(_BaseFrameServer):
                             e,
                         )
         except BaseException:
-            if (
-                public_key
-                and not getattr(self, "_command_persistence_committed", False)
-            ):
+            if public_key and not getattr(self, "_command_persistence_committed", False):
                 self._restore_contact(public_key, before_contact)
             self._clear_durable_command()
             raise
-        if (
-            getattr(self, "_command_persistence_error", None) is not None
-            and public_key
-        ):
+        if getattr(self, "_command_persistence_error", None) is not None and public_key:
             self._restore_contact(public_key, before_contact)
         committed = self._finish_durable_command()
         if committed and public_key:
@@ -1656,9 +1651,7 @@ class CompanionFrameServer(_BaseFrameServer):
     async def _cmd_set_channel_durable(self, data: bytes) -> None:
         """Apply upstream parsing, then acknowledge only after durable commit."""
         idx = data[0] if data else None
-        before_channel = (
-            copy.deepcopy(self.bridge.get_channel(idx)) if idx is not None else None
-        )
+        before_channel = copy.deepcopy(self.bridge.get_channel(idx)) if idx is not None else None
         self._begin_durable_command()
         self._channel_command_index = idx
         self._channel_command_before = self._channel_record(idx)
@@ -1669,17 +1662,11 @@ class CompanionFrameServer(_BaseFrameServer):
                 self._channel_command_index = None
                 self._channel_command_before = None
         except BaseException:
-            if (
-                idx is not None
-                and not getattr(self, "_command_persistence_committed", False)
-            ):
+            if idx is not None and not getattr(self, "_command_persistence_committed", False):
                 self._restore_channel(idx, before_channel)
             self._clear_durable_command()
             raise
-        if (
-            getattr(self, "_command_persistence_error", None) is not None
-            and idx is not None
-        ):
+        if getattr(self, "_command_persistence_error", None) is not None and idx is not None:
             self._restore_channel(idx, before_channel)
         self._finish_durable_command()
 

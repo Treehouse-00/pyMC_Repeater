@@ -218,6 +218,52 @@ def _post(endpoints, body, idempotency_key="idem-1", headers=None):
 
 
 class TestSendMessage:
+    def test_scoped_channel_capability_and_dispatch(self, endpoints, bridge, monkeypatch):
+        route = endpoints._cp_dispatch([_NAME, "messages", "scoped"])
+        assert route == endpoints.scoped_messages
+        capability = _call(route, companion_name=_NAME)
+        assert capability["data"] == {
+            "supported": True,
+            "public_key": bridge.get_public_key().hex(),
+        }
+        calls = []
+
+        async def scoped_send(idx, text, *, region):
+            calls.append((idx, text, region))
+            bridge._capture_hash()
+            return True
+
+        monkeypatch.setattr(bridge, "send_channel_message", scoped_send)
+        body = {"channel_idx": 0, "text": "regional hello", "region": " #South-Bay "}
+        _post(endpoints, body)
+        first = _call(route, companion_name=_NAME)
+        assert first["data"]["sent"] is True
+        _post(endpoints, {**body, "region": "south-bay"})
+        assert _call(route, companion_name=_NAME) == first
+        assert calls == [(0, "regional hello", "south-bay")]
+        for changed in ({**body, "region": "north"}, {"channel_idx": 0, "text": body["text"]}):
+            _post(endpoints, changed)
+            target = route if "region" in changed else endpoints.messages
+            with pytest.raises(cherrypy.HTTPError) as exc:
+                _call(target, companion_name=_NAME)
+            assert exc.value.status == 409
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("region", [None, "", "#", "a/b", "a b", "é", "a" * 31, 5])
+    def test_scoped_channel_rejects_invalid_region(self, endpoints, bridge, region):
+        _post(endpoints, {"channel_idx": 0, "text": "hello", "region": region})
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(endpoints.scoped_messages, companion_name=_NAME)
+        assert exc.value.status == 400
+        assert bridge.sent_channels == []
+
+    def test_scoped_channel_rejects_direct_message(self, endpoints, bridge):
+        _post(endpoints, {"to": _PUBKEY_HEX, "text": "hello", "region": "south"})
+        with pytest.raises(cherrypy.HTTPError) as exc:
+            _call(endpoints.scoped_messages, companion_name=_NAME)
+        assert exc.value.status == 400
+        assert bridge.sent_texts == []
+
     @staticmethod
     def _assert_dispatch_unavailable_is_terminal(
         endpoints,
@@ -1007,9 +1053,7 @@ class TestSendMessage:
         message = handler.companion_message_get_by_id(_HASH, message_id)
         assert key["state"] == message["state"] == "indeterminate"
         assert key["packet_hash"] == message["packet_hash"] == "AB" * 8
-        assert key["expected_ack"] == message["expected_ack"] == (
-            None if is_channel else 123
-        )
+        assert key["expected_ack"] == message["expected_ack"] == (None if is_channel else 123)
 
         _post(endpoints, body, idempotency_key="prune-race")
         retry = _call(endpoints.messages, companion_name=_NAME)

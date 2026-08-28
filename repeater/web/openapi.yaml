@@ -6465,6 +6465,96 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponseV1'
 
+  /v1/companions/{name}/messages/scoped:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/CompanionRegistrationName'
+    get:
+      tags: [Mobile Companion API v1]
+      summary: Probe per-message region support for this companion
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Supported; public_key identifies the full companion identity.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [supported, public_key]
+                        properties:
+                          supported:
+                            type: boolean
+                            enum: [true]
+                          public_key:
+                            type: string
+                            pattern: '^[0-9a-f]{64}$'
+        '401':
+          $ref: '#/paths/~1v1~1companions~1{name}~1messages/get/responses/401'
+        '404':
+          $ref: '#/paths/~1v1~1companions~1{name}~1messages/get/responses/404'
+    post:
+      tags: [Mobile Companion API v1]
+      summary: Send channel text with a region for this message only
+      description: |
+        Uses the normal message send and idempotency contract. Region names
+        are trimmed, optionally prefixed with #, lowercased, and validated
+        as 1–30 ASCII letters, digits, or hyphens. The normalized region is
+        part of the idempotency request identity. Never changes companion
+        preferences or channel keys. Never fall back to ordinary /messages
+        after a scoped request fails. Region display metadata remains local
+        to the sending client; this endpoint does not change history schema.
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/paths/~1v1~1companions~1{name}~1messages/post/parameters/1'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [channel_idx, text, region]
+              properties:
+                channel_idx:
+                  type: integer
+                  minimum: 0
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 160
+                  description: UTF-8 byte limit also includes the companion name and colon-space prefix. NUL is rejected.
+                region:
+                  type: string
+                  description: Canonical form is 1–30 lowercase ASCII letters, digits, or hyphens.
+                  example: south-bay
+      responses:
+        '200':
+          $ref: '#/paths/~1v1~1companions~1{name}~1messages/post/responses/200'
+        '400':
+          $ref: '#/paths/~1v1~1companions~1{name}~1messages/post/responses/400'
+        '401':
+          $ref: '#/paths/~1v1~1companions~1{name}~1messages/post/responses/401'
+        '404':
+          $ref: '#/paths/~1v1~1companions~1{name}~1messages/post/responses/404'
+        '409':
+          $ref: '#/paths/~1v1~1companions~1{name}~1messages/post/responses/409'
+        '429':
+          $ref: '#/paths/~1v1~1companions~1{name}~1messages/post/responses/429'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableV1'
+
   /v1/companions/{name}/events:
     get:
       tags: [Mobile Companion API v1]
