@@ -1197,6 +1197,12 @@ class RepeaterHandler(BaseHandler):
         packet.path.extend(self.local_hash_bytes[:hash_size])
         packet.path_len = PathUtils.encode_path_len(hash_size, hop_count + 1)
 
+        # This is a transit packet received over RF. Its existing scope decision
+        # is authoritative: a plain flood must remain plain, and a transport
+        # flood must retain the originator's codes when the shared dispatcher
+        # performs its send-time scope resolution.
+        packet._flood_scope_applied = True
+
         return packet
 
     def direct_forward(self, packet: Packet, packet_hash: Optional[str] = None) -> Optional[Packet]:
