@@ -4247,6 +4247,42 @@ paths:
               schema:
                 type: object
 
+  /companion/messages:
+    get:
+      tags: [System]
+      summary: Received companion message history, oldest first
+      description: |
+        Messages received by the companion, delivered or not, with ascending ids.
+        Pass the last id seen as `since` to read only what is new.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: companion_name
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+
   /companion/import_repeater_contacts:
     post:
       tags: [System]

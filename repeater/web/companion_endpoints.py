@@ -363,6 +363,62 @@ class CompanionAPIEndpoints:
             }
         )
 
+    def _bridge_hash_str(self, bridge) -> str:
+        """The storage key (``0x??``) of a resolved bridge."""
+        bridges = getattr(self.daemon_instance, "companion_bridges", {}) or {}
+        for hash_byte, candidate in bridges.items():
+            if candidate is bridge:
+                return f"0x{hash_byte:02x}"
+        raise cherrypy.HTTPError(404, "Companion not found")
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @require_auth
+    def messages(self, **kwargs):
+        """GET /api/companion/messages?since=<id>&limit=<n> — received message history.
+
+        Oldest first, ``id`` ascending; pass the last ``id`` seen as ``since``
+        to read only what is new. Rows a frame client has synced are included
+        (``delivered`` true), so every client reads the same mailbox.
+        """
+        bridge = self._get_bridge(**self._resolve_bridge_params(kwargs))
+        sqlite_handler = self._get_sqlite_handler()
+        try:
+            since = int(kwargs.get("since", 0))
+            limit = int(kwargs.get("limit", 100))
+        except (TypeError, ValueError):
+            raise cherrypy.HTTPError(400, "since and limit must be integers")
+        if since < 0 or limit < 1:
+            raise cherrypy.HTTPError(400, "since must be >= 0 and limit >= 1")
+        limit = min(limit, 500)
+        rows = sqlite_handler.companion_load_history(self._bridge_hash_str(bridge), since, limit)
+        if rows is None:
+            raise cherrypy.HTTPError(503, "Message history unavailable")
+        items = []
+        for row in rows:
+            sender_key = row.get("sender_key") or b""
+            payload = row.get("channel_data_payload") or b""
+            items.append(
+                {
+                    "id": row["id"],
+                    "sender_key": sender_key.hex() if isinstance(sender_key, bytes) else sender_key,
+                    "txt_type": row.get("txt_type", 0),
+                    "timestamp": row.get("timestamp", 0),
+                    "text": row.get("text", ""),
+                    "is_channel": bool(row.get("is_channel")),
+                    "channel_idx": row.get("channel_idx", 0),
+                    "path_len": row.get("path_len", 0),
+                    "sender_prefix": row.get("sender_prefix") or "",
+                    "snr": float(row.get("snr") or 0.0),
+                    "rssi": int(row.get("rssi") or 0),
+                    "channel_data_type": int(row.get("channel_data_type") or 0),
+                    "channel_data_payload": payload.hex() if isinstance(payload, bytes) else "",
+                    "delivered": row.get("delivered_at") is not None,
+                    "received_at": row.get("created_at", 0),
+                }
+            )
+        return self._success(items)
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     @require_auth

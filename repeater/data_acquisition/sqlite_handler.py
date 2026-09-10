@@ -4302,6 +4302,34 @@ class SQLiteHandler:
             logger.error(f"Failed to push companion message: {e}")
             return False
 
+    def companion_load_history(
+        self, companion_hash: str, since_id: int = 0, limit: int = 100
+    ) -> Optional[List[Dict]]:
+        """Received messages after ``since_id`` (exclusive), oldest first, with ids.
+
+        Delivered and undelivered rows alike: this is the mailbox a client
+        reads by cursor, not the frame queue. Returns None on failure so a
+        caller never mistakes an error for an empty page.
+        """
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """
+                    SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
+                           path_len, sender_prefix, snr, rssi, channel_data_type,
+                           channel_data_payload, delivered_at, created_at
+                    FROM companion_messages
+                    WHERE companion_hash = ? AND id > ?
+                    ORDER BY id ASC LIMIT ?
+                """,
+                    (companion_hash, since_id, limit),
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Failed to load companion history for {companion_hash}: {e}")
+            return None
+
     def companion_next_undelivered_message(self, companion_hash: str) -> Optional[Dict]:
         """Return the oldest undelivered message (with its ``id``) without consuming it.
 
