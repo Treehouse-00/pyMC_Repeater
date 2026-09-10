@@ -27,8 +27,9 @@ def set_daemon(instance):
 class CompanionFrameWebSocket(WebSocket):
     def opened(self):
         """Authenticate, resolve companion, open TCP socket, start reader."""
-        # JWT auth — same pattern as PacketWebSocket
+        # JWT or API-token auth — same pattern as PacketWebSocket
         jwt_handler = cherrypy.config.get("jwt_handler")
+        token_manager = cherrypy.config.get("token_manager")
 
         qs = ""
         if hasattr(self, "environ"):
@@ -38,24 +39,39 @@ class CompanionFrameWebSocket(WebSocket):
         token = params.get("token", [None])[0]
         companion_name = params.get("companion_name", [None])[0]
 
+        api_key = self.environ.get("HTTP_X_API_KEY", "") if hasattr(self, "environ") else ""
+
         if not jwt_handler:
             logger.warning("Connection rejected: no JWT handler configured")
             self.close(code=1011, reason="server configuration error")
             return
 
-        if not token:
+        if not token and not api_key:
             logger.warning("Connection rejected: missing token")
             self.close(code=1008, reason="unauthorized")
             return
 
-        try:
-            payload = jwt_handler.verify_jwt(token)
-            if not payload:
-                logger.warning("Connection rejected: invalid token")
-                self.close(code=1008, reason="unauthorized")
-                return
-        except Exception as e:
-            logger.warning(f"Auth error: {e}")
+        user = None
+        if token:
+            try:
+                payload = jwt_handler.verify_jwt(token)
+                if payload:
+                    user = payload.get("sub", "unknown")
+            except Exception as e:
+                logger.warning(f"Auth error: {e}")
+
+        if user is None:
+            api_token = api_key or token
+            if api_token and token_manager:
+                try:
+                    token_info = token_manager.verify_token(api_token)
+                    if token_info:
+                        user = f"api_token:{token_info.get('name', 'unknown')}"
+                except Exception as e:
+                    logger.warning(f"API key auth error: {e}")
+
+        if user is None:
+            logger.warning("Connection rejected: invalid token")
             self.close(code=1008, reason="unauthorized")
             return
 
@@ -93,7 +109,6 @@ class CompanionFrameWebSocket(WebSocket):
         )
         self._reader.start()
 
-        user = payload.get("sub", "unknown")
         logger.info(
             f"Companion WS opened: user={user}, companion={companion_name}, tcp={tcp_host}:{tcp_port}"
         )

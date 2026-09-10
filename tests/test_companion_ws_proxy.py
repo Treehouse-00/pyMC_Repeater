@@ -14,9 +14,11 @@ def cp_cfg(monkeypatch):
     return cfg
 
 
-def _ws(query_string):
+def _ws(query_string, api_key=None):
     ws = object.__new__(proxy.CompanionFrameWebSocket)
     ws.environ = {"QUERY_STRING": query_string}
+    if api_key is not None:
+        ws.environ["HTTP_X_API_KEY"] = api_key
     ws.close = MagicMock()
     ws.send = MagicMock()
     ws._teardown = MagicMock()
@@ -39,6 +41,52 @@ def test_opened_rejects_missing_token(cp_cfg):
 def test_opened_rejects_invalid_token(cp_cfg):
     cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=lambda _t: None)
     ws = _ws("token=t&companion_name=c1")
+    ws.opened()
+    ws.close.assert_called_once_with(code=1008, reason="unauthorized")
+
+
+def test_opened_accepts_api_key_header(cp_cfg, monkeypatch):
+    cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=lambda _t: None)
+    cp_cfg["token_manager"] = SimpleNamespace(
+        verify_token=lambda t: {"name": "waev"} if t == "k" else None
+    )
+    ws = _ws("companion_name=c1", api_key="k")
+    ws._resolve_tcp_endpoint = MagicMock(return_value=("127.0.0.1", 5000))
+    fake_socket = MagicMock()
+    monkeypatch.setattr(proxy.socket, "socket", lambda *_args, **_kwargs: fake_socket)
+    monkeypatch.setattr(proxy.threading, "Thread", lambda **_kw: MagicMock())
+
+    ws.opened()
+
+    ws.close.assert_not_called()
+    assert ws._companion_name == "c1"
+
+
+def test_opened_accepts_api_token_in_query_like_packet_ws(cp_cfg, monkeypatch):
+    cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=lambda _t: None)
+    cp_cfg["token_manager"] = SimpleNamespace(verify_token=lambda _t: {"name": "waev"})
+    ws = _ws("token=k&companion_name=c1")
+    ws._resolve_tcp_endpoint = MagicMock(return_value=("127.0.0.1", 5000))
+    fake_socket = MagicMock()
+    monkeypatch.setattr(proxy.socket, "socket", lambda *_args, **_kwargs: fake_socket)
+    monkeypatch.setattr(proxy.threading, "Thread", lambda **_kw: MagicMock())
+
+    ws.opened()
+
+    ws.close.assert_not_called()
+
+
+def test_opened_rejects_unknown_api_key(cp_cfg):
+    cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=lambda _t: None)
+    cp_cfg["token_manager"] = SimpleNamespace(verify_token=lambda _t: None)
+    ws = _ws("companion_name=c1", api_key="bad")
+    ws.opened()
+    ws.close.assert_called_once_with(code=1008, reason="unauthorized")
+
+
+def test_opened_rejects_api_key_without_token_manager(cp_cfg):
+    cp_cfg["jwt_handler"] = SimpleNamespace(verify_jwt=lambda _t: None)
+    ws = _ws("companion_name=c1", api_key="k")
     ws.opened()
     ws.close.assert_called_once_with(code=1008, reason="unauthorized")
 
