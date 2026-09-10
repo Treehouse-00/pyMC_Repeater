@@ -455,7 +455,8 @@ class TestSenderPrefixPersistence:
         fs = CompanionFrameServer.__new__(CompanionFrameServer)
         fs.sqlite_handler = MagicMock()
         fs.companion_hash = "0x01"
-        fs.sqlite_handler.companion_pop_message.return_value = {
+        fs.sqlite_handler.companion_next_undelivered_message.return_value = {
+            "id": 1,
             "sender_key": b"\x01" * 32,
             "txt_type": 2,
             "timestamp": 42,

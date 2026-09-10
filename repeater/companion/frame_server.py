@@ -28,6 +28,11 @@ class CompanionFrameServer(_BaseFrameServer):
     zero changes.
     """
 
+    # (client writer, SQLite message id) handed out by SYNC_NEXT_MESSAGE and
+    # not yet acknowledged. The client's next command is the receipt; a
+    # client that leaves first keeps the row queued.
+    _pending_delivery: Optional[tuple] = None
+
     def __init__(
         self,
         bridge,
@@ -156,12 +161,18 @@ class CompanionFrameServer(_BaseFrameServer):
         self.bridge.message_queue.remove(queue_entry)
 
     def _sync_next_from_persistence(self) -> Optional[QueuedMessage]:
-        """Retrieve next message from SQLite when bridge queue is empty."""
+        """Retrieve the next undelivered SQLite message when the bridge queue is empty.
+
+        The row is not consumed here: it is marked delivered when the client's
+        next command arrives (:meth:`_handle_cmd`), so a client that drops
+        between the read and the receipt sees the message again.
+        """
         if not self.sqlite_handler:
             return None
-        msg_dict = self.sqlite_handler.companion_pop_message(self.companion_hash)
+        msg_dict = self.sqlite_handler.companion_next_undelivered_message(self.companion_hash)
         if not msg_dict:
             return None
+        self._pending_delivery = (getattr(self, "_client_writer", None), msg_dict["id"])
         sender_prefix = msg_dict.get("sender_prefix", b"")
         if isinstance(sender_prefix, str):
             sender_prefix = bytes.fromhex(sender_prefix) if sender_prefix else b""
@@ -183,6 +194,27 @@ class CompanionFrameServer(_BaseFrameServer):
     # -----------------------------------------------------------------
     # Non-blocking command overrides (keep event loop responsive)
     # -----------------------------------------------------------------
+
+    def _ack_pending_delivery(self) -> None:
+        """Mark the outstanding delivery received, if the same client is still here."""
+        pending, self._pending_delivery = self._pending_delivery, None
+        if pending is None:
+            return
+        writer, message_id = pending
+        if writer is getattr(self, "_client_writer", None):
+            self.sqlite_handler.companion_mark_delivered(self.companion_hash, message_id)
+
+    async def _handle_cmd(self, payload: bytes) -> None:
+        """Any further command from the client is the receipt for the last message."""
+        if self._pending_delivery is not None:
+            await asyncio.to_thread(self._ack_pending_delivery)
+        await super()._handle_cmd(payload)
+
+    async def _cleanup_client(self, writer, write_queue, writer_task, disconnect_reason) -> None:
+        """A client that leaves without acknowledging keeps its last message queued."""
+        if self._pending_delivery is not None and self._pending_delivery[0] is writer:
+            self._pending_delivery = None
+        await super()._cleanup_client(writer, write_queue, writer_task, disconnect_reason)
 
     async def _cmd_sync_next_message(self, data: bytes) -> None:
         """Sync next message; run persistence read in thread so SQLite does not block."""

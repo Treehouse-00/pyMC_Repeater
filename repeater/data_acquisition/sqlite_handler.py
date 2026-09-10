@@ -709,6 +709,27 @@ class SQLiteHandler:
                     )
                     logger.info(f"Migration '{migration_name}' applied successfully")
 
+                # companion_messages.delivered_at: NULL marks the undelivered
+                # queue; a delivered row is history until retention prunes it.
+                # Guarded on the column as well as the marker, so a table
+                # rebuilt by an earlier migration gets it back.
+                migration_name = "add_delivered_at_to_companion_messages"
+                cursor = conn.execute("PRAGMA table_info(companion_messages)")
+                columns = [column[1] for column in cursor.fetchall()]
+                if "delivered_at" not in columns:
+                    conn.execute("ALTER TABLE companion_messages ADD COLUMN delivered_at REAL")
+                    logger.info("Added delivered_at column to companion_messages table")
+                existing = conn.execute(
+                    "SELECT migration_name FROM migrations WHERE migration_name = ?",
+                    (migration_name,),
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO migrations (migration_name, applied_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    logger.info(f"Migration '{migration_name}' applied successfully")
+
                 # Migration 13: Add upstream hash fields to packets for
                 # neighbour-link history lookups and indexing.
                 migration_name = "add_upstream_hash_to_packets"
@@ -2857,14 +2878,14 @@ class SQLiteHandler:
     def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
         """Prune retention-bounded tables.
 
-        ``companion_events_days`` is forwarded from engine.py
-        (``storage.retention.companion_events_days``, default 31). Accepted here
-        so the periodic cleanup call cannot TypeError and silently skip all
-        SQLite pruning. Companion journal/history pruning is layered on by the
-        companion-api storage work once those tables exist.
+        ``companion_events_days`` (``storage.retention.companion_events_days``,
+        default 31) bounds delivered companion message history. Undelivered
+        messages are a queue, not history, and are never pruned here.
         """
         try:
             cutoff = time.time() - (days * 24 * 3600)
+            history_days = companion_events_days if companion_events_days is not None else 31
+            history_cutoff = time.time() - (history_days * 24 * 3600)
 
             with self._connect() as conn:
                 result = conn.execute("DELETE FROM packets WHERE timestamp < ?", (cutoff,))
@@ -2887,6 +2908,13 @@ class SQLiteHandler:
                 result = conn.execute("DELETE FROM crc_errors WHERE timestamp < ?", (cutoff,))
                 crc_deleted = result.rowcount
 
+                result = conn.execute(
+                    "DELETE FROM companion_messages "
+                    "WHERE delivered_at IS NOT NULL AND delivered_at < ?",
+                    (history_cutoff,),
+                )
+                companion_deleted = result.rowcount
+
                 conn.commit()
 
                 if (
@@ -2894,9 +2922,10 @@ class SQLiteHandler:
                     or adverts_deleted > 0
                     or noise_deleted > 0
                     or crc_deleted > 0
+                    or companion_deleted > 0
                 ):
                     logger.info(
-                        f"Cleaned up {packets_deleted} old packets, {adverts_deleted} old adverts, {noise_deleted} old noise measurements, {crc_deleted} old CRC error records"
+                        f"Cleaned up {packets_deleted} old packets, {adverts_deleted} old adverts, {noise_deleted} old noise measurements, {crc_deleted} old CRC error records, {companion_deleted} delivered companion messages"
                     )
 
         except Exception as e:
@@ -4114,11 +4143,12 @@ class SQLiteHandler:
             return False
 
     def companion_count_messages(self, companion_hash: str) -> int:
-        """Return the number of persisted queued messages for a companion."""
+        """Return the number of undelivered queued messages for a companion."""
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
-                    "SELECT COUNT(*) FROM companion_messages WHERE companion_hash = ?",
+                    "SELECT COUNT(*) FROM companion_messages "
+                    "WHERE companion_hash = ? AND delivered_at IS NULL",
                     (companion_hash,),
                 )
                 row = cursor.fetchone()
@@ -4130,7 +4160,7 @@ class SQLiteHandler:
     def companion_load_messages(
         self, companion_hash: str, limit: int = 100
     ) -> Optional[List[Dict]]:
-        """Load queued messages for a companion (oldest first for queue order).
+        """Load undelivered queued messages for a companion (oldest first).
 
         Returns [] when the companion has no persisted messages, or None when
         the load failed — callers must not treat a failed load as "no data".
@@ -4143,7 +4173,8 @@ class SQLiteHandler:
                     SELECT sender_key, txt_type, timestamp, text, is_channel, channel_idx,
                            path_len, sender_prefix, snr, rssi, channel_data_type,
                            channel_data_payload
-                    FROM companion_messages WHERE companion_hash = ?
+                    FROM companion_messages
+                    WHERE companion_hash = ? AND delivered_at IS NULL
                     ORDER BY id ASC LIMIT ?
                 """,
                     (companion_hash, limit),
@@ -4224,7 +4255,8 @@ class SQLiteHandler:
                 if max_messages is not None:
                     last_id = cursor.lastrowid
                     count = conn.execute(
-                        "SELECT COUNT(*) FROM companion_messages WHERE companion_hash = ?",
+                        "SELECT COUNT(*) FROM companion_messages "
+                        "WHERE companion_hash = ? AND delivered_at IS NULL",
                         (companion_hash,),
                     ).fetchone()[0]
                     excess = count - max_messages
@@ -4238,6 +4270,7 @@ class SQLiteHandler:
                             """
                             SELECT COUNT(*) FROM companion_messages
                             WHERE companion_hash = ? AND is_channel = 1 AND id != ?
+                              AND delivered_at IS NULL
                             """,
                             (companion_hash, last_id),
                         ).fetchone()[0]
@@ -4256,6 +4289,7 @@ class SQLiteHandler:
                             WHERE id IN (
                                 SELECT id FROM companion_messages
                                 WHERE companion_hash = ? AND is_channel = 1 AND id != ?
+                                  AND delivered_at IS NULL
                                 ORDER BY id ASC LIMIT ?
                             )
                             """,
@@ -4268,8 +4302,13 @@ class SQLiteHandler:
             logger.error(f"Failed to push companion message: {e}")
             return False
 
-    def companion_pop_message(self, companion_hash: str) -> Optional[Dict]:
-        """Remove and return the oldest message from the companion's queue."""
+    def companion_next_undelivered_message(self, companion_hash: str) -> Optional[Dict]:
+        """Return the oldest undelivered message (with its ``id``) without consuming it.
+
+        The caller marks it delivered with :meth:`companion_mark_delivered`
+        once the client has demonstrably received it; until then a dropped
+        connection simply sees the same message again.
+        """
         try:
             with self._connect() as conn:
                 conn.row_factory = sqlite3.Row
@@ -4278,7 +4317,8 @@ class SQLiteHandler:
                     SELECT id, sender_key, txt_type, timestamp, text, is_channel, channel_idx,
                            path_len, sender_prefix, snr, rssi, channel_data_type,
                            channel_data_payload
-                    FROM companion_messages WHERE companion_hash = ?
+                    FROM companion_messages
+                    WHERE companion_hash = ? AND delivered_at IS NULL
                     ORDER BY id ASC LIMIT 1
                 """,
                     (companion_hash,),
@@ -4292,9 +4332,30 @@ class SQLiteHandler:
                 msg["rssi"] = int(msg.get("rssi") or 0)
                 msg["channel_data_type"] = int(msg.get("channel_data_type") or 0)
                 msg["channel_data_payload"] = bytes(msg.get("channel_data_payload") or b"")
-                conn.execute("DELETE FROM companion_messages WHERE id = ?", (msg["id"],))
-                conn.commit()
-                return {k: v for k, v in msg.items() if k != "id"}
+                return msg
         except Exception as e:
-            logger.error(f"Failed to pop companion message: {e}")
+            logger.error(f"Failed to read next companion message: {e}")
             return None
+
+    def companion_mark_delivered(self, companion_hash: str, message_id: int) -> bool:
+        """Mark one queued message delivered; it stays as history until pruned."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "UPDATE companion_messages SET delivered_at = ? "
+                    "WHERE id = ? AND companion_hash = ? AND delivered_at IS NULL",
+                    (time.time(), message_id, companion_hash),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to mark companion message delivered: {e}")
+            return False
+
+    def companion_pop_message(self, companion_hash: str) -> Optional[Dict]:
+        """Return the oldest undelivered message and mark it delivered at once."""
+        msg = self.companion_next_undelivered_message(companion_hash)
+        if not msg:
+            return None
+        self.companion_mark_delivered(companion_hash, msg["id"])
+        return {k: v for k, v in msg.items() if k != "id"}

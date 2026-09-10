@@ -112,8 +112,10 @@ def test_bridge_load_prefs_ignores_invalid_or_missing_backend():
 async def test_frame_server_persistence_paths_and_stop():
     sqlite = SimpleNamespace(
         companion_push_message=MagicMock(),
-        companion_pop_message=MagicMock(
+        companion_mark_delivered=MagicMock(),
+        companion_next_undelivered_message=MagicMock(
             return_value={
+                "id": 7,
                 "sender_key": b"k",
                 "txt_type": 1,
                 "timestamp": 2,
@@ -206,13 +208,14 @@ async def test_frame_server_no_more_messages_response_when_empty():
 @pytest.mark.asyncio
 async def test_restart_queue_rows_are_delivered_once_from_sqlite():
     sqlite = SimpleNamespace(
-        companion_pop_message=MagicMock(
+        companion_mark_delivered=MagicMock(),
+        companion_next_undelivered_message=MagicMock(
             side_effect=[
-                {"sender_key": b"a", "timestamp": 1, "text": "first"},
-                {"sender_key": b"b", "timestamp": 2, "text": "second"},
+                {"id": 1, "sender_key": b"a", "timestamp": 1, "text": "first"},
+                {"id": 2, "sender_key": b"b", "timestamp": 2, "text": "second"},
                 None,
             ]
-        )
+        ),
     )
     bridge = SimpleNamespace(sync_next_message=lambda: None)
 
@@ -234,7 +237,7 @@ async def test_restart_queue_rows_are_delivered_once_from_sqlite():
         b"second",
         bytes([RESP_CODE_NO_MORE_MESSAGES]),
     ]
-    assert sqlite.companion_pop_message.call_count == 3
+    assert sqlite.companion_next_undelivered_message.call_count == 3
 
 
 @pytest.mark.asyncio
