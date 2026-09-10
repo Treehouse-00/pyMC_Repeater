@@ -13,6 +13,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from openhop_core.node.dispatcher import Dispatcher
 from openhop_core.protocol import Packet, PacketBuilder
 from openhop_core.protocol.constants import (
     MAX_PATH_SIZE,
@@ -27,6 +28,7 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from openhop_core.protocol.packet_utils import PathUtils
+from openhop_core.protocol.transport_keys import get_auto_key_for
 
 # ---------------------------------------------------------------------------
 # Helpers — build minimal config / mocks needed by RepeaterHandler.__init__
@@ -103,6 +105,13 @@ def _make_dispatcher(radio=None):
     dispatcher.radio = radio or _make_radio()
     dispatcher.local_identity = MagicMock()
     dispatcher.send_packet = AsyncMock()
+    return dispatcher
+
+
+def _make_scope_resolver(default_region: str = "#washington") -> Dispatcher:
+    """Create the real core TX resolver used after repeater forwarding."""
+    dispatcher = Dispatcher(_make_radio())
+    dispatcher.default_flood_transport_key = get_auto_key_for(default_region)
     return dispatcher
 
 
@@ -316,6 +325,50 @@ class TestFloodForward:
         result = handler.flood_forward(pkt)
         assert result is not None
         assert list(result.path) == [LOCAL_HASH]
+
+    def test_relayed_plain_flood_does_not_inherit_dispatcher_default(self, handler):
+        """A repeater preserves the originator's deliberate unscoped flood."""
+        packet = _make_flood_packet(payload=b"remote unscoped message")
+
+        forwarded = handler.flood_forward(packet)
+
+        assert forwarded is not None
+        assert forwarded._flood_scope_applied is True
+
+        resolver = _make_scope_resolver("#washington")
+        resolver._apply_flood_scope(forwarded)
+
+        assert forwarded.get_route_type() == ROUTE_TYPE_FLOOD
+        assert forwarded.transport_codes == [0, 0]
+
+    def test_relayed_transport_flood_preserves_foreign_scope(self, handler):
+        """A local default cannot replace the transport codes received over RF."""
+        packet = _make_transport_flood_packet(
+            payload=b"remote scoped message",
+            transport_codes=(0x1234, 0x5678),
+        )
+
+        with patch.object(handler, "_check_transport_codes", return_value=(True, "")):
+            forwarded = handler.flood_forward(packet)
+
+        assert forwarded is not None
+        assert forwarded._flood_scope_applied is True
+
+        resolver = _make_scope_resolver("#washington")
+        resolver._apply_flood_scope(forwarded)
+
+        assert forwarded.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert forwarded.transport_codes == [0x1234, 0x5678]
+
+    def test_fresh_local_flood_still_inherits_dispatcher_default(self):
+        """The relay fix must not weaken default scoping for local sends."""
+        packet = _make_flood_packet(payload=b"locally originated message")
+        resolver = _make_scope_resolver("#washington")
+
+        resolver._apply_flood_scope(packet)
+
+        assert packet.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert packet.transport_codes[0] != 0
 
 
 # ===================================================================
