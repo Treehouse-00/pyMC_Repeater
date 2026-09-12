@@ -384,7 +384,7 @@ def test_the_collector_facade_takes_the_egress_rows(handler):
     collector._submit_db = lambda fn, *args: fn(*args)
     record = {"timestamp": BASE_TS, "type": 1, "route": 1, "length": 40, "transmitted": True}
 
-    collector.record_packet(record, skip_mqtt_if_invalid=False, tx_egress=[_egress("link")])
+    collector.record_packet(record, skip_mqtt=False, tx_egress=[_egress("link")])
 
     with sqlite3.connect(handler.sqlite_path) as conn:
         assert conn.execute("SELECT radio_id FROM packet_egress").fetchone()[0] == "link"
