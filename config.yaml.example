@@ -763,11 +763,12 @@ mqtt_brokers:
   #     it, and every radio that retransmitted it (a bridge repeating on both
   #     sides lists both). `tx_radio_ids` is always a list; it is absent when
   #     the packet was not repeated.
-  #   - `radios` in the status message: `[{id, radio}]` mapping each radio id
-  #     to its `MHz,kHz,SF,CR` settings, so a consumer can resolve those ids to
-  #     frequencies. Ids are unique only within a node - key on
-  #     (origin_id, id). The top-level `radio` field then reports the default
-  #     radio.
+  #   - `radios` in the status message: `[{id, radio, tx_power}]` mapping each
+  #     radio id to its `MHz,kHz,SF,CR` settings and its power in dBm, so a
+  #     consumer can resolve those ids to frequencies. `tx_power` is omitted
+  #     when the config does not set it and the radio type has no default. Ids
+  #     are unique only within a node - key on (origin_id, id). The top-level
+  #     `radio` field then reports the default radio.
   # Single-radio nodes publish neither, exactly as before.
 
   # Block specific packet types from being published to the MQTT endpoint

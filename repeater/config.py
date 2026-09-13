@@ -1008,12 +1008,15 @@ def _validate_fabric_fanout(fabric_cfg, tx_mode: str, radio_count: int) -> tuple
 # Air-setting defaults per radio_type, mirroring ``get_radio_for_board``. The
 # SX1262 paths require every field in the config, so their entries only matter
 # for a malformed config that never reaches hardware.
+# tx_power has no common default: get_radio_for_board applies a different one
+# per radio type, and requires the key outright for sx1262, so a profile for a
+# config that omits it reports the power as unknown rather than inventing one.
 _RADIO_AIR_DEFAULTS = {
     "sx1262": {"preamble_length": 16},
     "sx1262_ch341": {"preamble_length": 16},
-    "kiss": {"preamble_length": 32},
-    "modem_tcp": {"preamble_length": 16},
-    "modem_usb": {"preamble_length": 16},
+    "kiss": {"preamble_length": 32, "tx_power": 14},
+    "modem_tcp": {"preamble_length": 16, "tx_power": 22},
+    "modem_usb": {"preamble_length": 16, "tx_power": 22},
 }
 _RADIO_AIR_COMMON_DEFAULTS = {
     "frequency": 869618000,
@@ -1055,12 +1058,22 @@ def _radio_air_profile(board_config: dict, radio_id: str) -> Optional[dict]:
     defaults = dict(_RADIO_AIR_COMMON_DEFAULTS)
     defaults.update(_RADIO_AIR_DEFAULTS[radio_type])
 
-    def _field(name: str) -> Optional[int]:
+    def _field(name: str, required: bool = True) -> Optional[int]:
         value = radio_cfg.get(name, defaults.get(name))
+        if isinstance(value, bool):
+            # int(True) is 1, which would report a plausible-looking dBm or SF
+            # that nobody configured.
+            value = None
+        if value is None and not required:
+            return None
         try:
             return int(value)
         except (TypeError, ValueError):
-            logger.warning(
+            # Status is published on a timer and this runs per publish, so an
+            # optional field logs once per level rather than for the life of the
+            # node. A field the radio cannot be built without is louder.
+            log = logger.warning if required else logger.debug
+            log(
                 "radio %s: unreadable %s=%r; reporting profile field as unknown",
                 radio_id,
                 name,
@@ -1076,6 +1089,7 @@ def _radio_air_profile(board_config: dict, radio_id: str) -> Optional[dict]:
         "spreading_factor": _field("spreading_factor"),
         "coding_rate": _field("coding_rate"),
         "preamble_length": _field("preamble_length"),
+        "tx_power": _field("tx_power", required=False),
     }
 
 
@@ -1228,6 +1242,20 @@ def build_radio_status_entries(config: dict) -> list:
     value repeats the ``MHz,kHz,SF,CR`` shape of the top-level status field so
     no second parser is needed.
 
+    Each entry also carries ``tx_power`` in dBm where it is known. Two radios on
+    one node often run different power -- a wide local radio turned down, a
+    narrow backhaul at full -- and that is not derivable from the air settings.
+    It is omitted rather than guessed when the config does not say, and unlike
+    the air settings it never voids the map: power does not decide which band a
+    packet was on, so an entry without it still attributes the packet correctly.
+
+    Every value here is what the node is **configured** with, not a reading from
+    the hardware. Two consequences worth knowing before trusting a figure: a
+    driver may clamp what it was given (an SX1262 holds -9..22 dBm), and editing
+    a ``radios[]`` entry does not reconfigure that radio live -- ``config_manager``
+    only applies the top-level ``radio`` section -- so after such an edit the map
+    leads the hardware until the service restarts.
+
     Returns an empty list when any radio's settings are unreadable: a partial
     map would silently attribute a packet to the wrong band, which is worse
     than an observer knowing the map is unavailable.
@@ -1247,7 +1275,11 @@ def build_radio_status_entries(config: dict) -> list:
                 profile.get("radio_id"),
             )
             return []
-        entries.append({"id": profile["radio_id"], "radio": format_radio_config_str(*fields)})
+        entry = {"id": profile["radio_id"], "radio": format_radio_config_str(*fields)}
+        tx_power = profile.get("tx_power")
+        if tx_power is not None:
+            entry["tx_power"] = tx_power
+        entries.append(entry)
     return entries
 
 

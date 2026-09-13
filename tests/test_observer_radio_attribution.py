@@ -12,9 +12,12 @@ existed.
 """
 
 import json
-from unittest.mock import MagicMock
+import logging
+from unittest.mock import MagicMock, patch
 
-from repeater.config import build_radio_status_entries, get_node_info
+import pytest
+
+from repeater.config import build_radio_status_entries, get_node_info, get_radio_for_board
 from repeater.data_acquisition.mqtt_handler import MeshCoreToMqttPusher
 from repeater.data_acquisition.storage_utils import PacketRecord
 
@@ -198,6 +201,103 @@ def test_unreadable_radio_settings_publish_no_map_at_all():
     assert build_radio_status_entries({"radios": [LOCAL_RADIO, broken]}) == []
 
 
+def _at_power(radio: dict, tx_power) -> dict:
+    """The fixture radio with a tx_power, or with the key removed for None."""
+    air = dict(radio["radio"])
+    if tx_power is None:
+        air.pop("tx_power", None)
+    else:
+        air["tx_power"] = tx_power
+    return {**radio, "radio": air}
+
+
+def test_each_radio_reports_its_own_tx_power():
+    """Two radios on one node often run different power, and that is not
+    derivable from the air settings."""
+    entries = build_radio_status_entries(
+        {"radios": [_at_power(LOCAL_RADIO, 14), _at_power(LINK_RADIO, 22)]}
+    )
+
+    assert [(entry["id"], entry["tx_power"]) for entry in entries] == [("local", 14), ("link", 22)]
+
+
+def _built_tx_power(board: dict) -> int:
+    """The tx_power get_radio_for_board actually hands the driver for this config."""
+    seen = {}
+
+    class _Driver:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def begin(self):
+            return True
+
+        def __getattr__(self, name):
+            return MagicMock()
+
+    def _kiss(port, baudrate, radio_config, **kwargs):
+        seen.update(radio_config)
+        return _Driver()
+
+    with (
+        patch("openhop_core.hardware.tcp_radio.TCPLoRaRadio", _Driver),
+        patch("openhop_core.hardware.usb_radio.USBLoRaRadio", _Driver),
+        patch("openhop_core.hardware.kiss_modem_wrapper.KissModemWrapper", _kiss),
+    ):
+        get_radio_for_board(board)
+    return seen["tx_power"]
+
+
+@pytest.mark.parametrize("radio_type", ["kiss", "modem_tcp", "modem_usb"])
+def test_a_radio_type_default_power_is_what_the_driver_is_given(radio_type):
+    """Asserted against get_radio_for_board rather than against a repeat of the
+    same literal, so a default changed there fails here instead of quietly
+    making the status map describe a power no radio is using."""
+    board = {
+        **_at_power(LOCAL_RADIO, None),
+        "radio_type": radio_type,
+        "kiss": {"port": "/dev/null"},
+        "modem_tcp": {"host": "127.0.0.1"},
+        "modem_usb": {"port": "/dev/null"},
+    }
+    radios = [{**board, "id": "local"}, _at_power(LINK_RADIO, 22)]
+
+    entries = build_radio_status_entries({"radios": radios})
+
+    assert entries[0]["tx_power"] == _built_tx_power(board)
+
+
+def test_a_boolean_tx_power_is_reported_as_unknown():
+    """int(True) is 1, a plausible-looking dBm nobody configured."""
+    entries = build_radio_status_entries(
+        {"radios": [_at_power(LOCAL_RADIO, True), _at_power(LINK_RADIO, 22)]}
+    )
+
+    assert "tx_power" not in entries[0]
+
+
+def test_an_unreadable_optional_field_does_not_warn_on_every_status(caplog):
+    """Status is published on a timer; a warning here would repeat forever."""
+    with caplog.at_level(logging.WARNING, logger="repeater.config"):
+        build_radio_status_entries(
+            {"radios": [_at_power(LOCAL_RADIO, "loud"), _at_power(LINK_RADIO, 22)]}
+        )
+
+    assert caplog.records == []
+
+
+def test_an_unknown_tx_power_is_omitted_without_voiding_the_map():
+    """sx1262 has no default power, and power does not decide which band a
+    packet was on: the entry still attributes it correctly."""
+    entries = build_radio_status_entries(
+        {"radios": [_at_power(LOCAL_RADIO, None), _at_power(LINK_RADIO, 22)]}
+    )
+
+    assert "tx_power" not in entries[0]
+    assert entries[0]["radio"] == "869.618,62.5,8,8"
+    assert entries[1]["tx_power"] == 22
+
+
 # --------------------------------------------------------------------
 # Status message on the wire
 # --------------------------------------------------------------------
@@ -250,6 +350,17 @@ def test_status_publishes_the_radio_map_for_a_two_radio_node():
     assert status["radios"] == [
         {"id": "local", "radio": "869.618,62.5,8,8"},
         {"id": "link", "radio": "864.2,62.5,11,8"},
+    ]
+
+
+def test_status_radio_map_carries_tx_power():
+    status = _publish_status(
+        _make_config(radios=[_at_power(LOCAL_RADIO, 14), _at_power(LINK_RADIO, 22)])
+    )
+
+    assert status["radios"] == [
+        {"id": "local", "radio": "869.618,62.5,8,8", "tx_power": 14},
+        {"id": "link", "radio": "864.2,62.5,11,8", "tx_power": 22},
     ]
 
 
