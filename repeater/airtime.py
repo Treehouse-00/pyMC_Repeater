@@ -1,5 +1,7 @@
 import logging
+import threading
 import time
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
@@ -142,6 +144,100 @@ class AirtimeManager:
         }
 
 
+class _RadioAirtimeBudget:
+    """A radio-specific calculator backed by a possibly shared ledger."""
+
+    def __init__(
+        self,
+        ledger: AirtimeManager,
+        calculator: AirtimeManager,
+        lock: threading.RLock,
+    ) -> None:
+        self._ledger = ledger
+        self._calculator = calculator
+        self._lock = lock
+
+    def _replace(self, ledger: AirtimeManager, calculator: AirtimeManager) -> None:
+        self._ledger = ledger
+        self._calculator = calculator
+
+    def calculate_airtime(self, *args, **kwargs) -> float:
+        with self._lock:
+            return self._calculator.calculate_airtime(*args, **kwargs)
+
+    def can_transmit(self, airtime_ms: float) -> Tuple[bool, float]:
+        with self._lock:
+            return self._ledger.can_transmit(airtime_ms)
+
+    def record_tx(self, airtime_ms: float) -> None:
+        with self._lock:
+            self._ledger.record_tx(airtime_ms)
+
+    def record_rx(self, airtime_ms: float) -> None:
+        with self._lock:
+            self._ledger.record_rx(airtime_ms)
+
+    def get_stats(self) -> dict:
+        with self._lock:
+            return self._ledger.get_stats()
+
+    @property
+    def max_airtime_per_minute(self) -> float:
+        with self._lock:
+            return self._ledger.max_airtime_per_minute
+
+    @property
+    def tx_history(self) -> list:
+        with self._lock:
+            return self._ledger.tx_history
+
+    @property
+    def total_airtime_ms(self) -> float:
+        with self._lock:
+            return self._ledger.total_airtime_ms
+
+    @property
+    def total_rx_airtime_ms(self) -> float:
+        with self._lock:
+            return self._ledger.total_rx_airtime_ms
+
+    @property
+    def radio_config(self) -> dict:
+        with self._lock:
+            return self._calculator.radio_config
+
+    @property
+    def spreading_factor(self):
+        with self._lock:
+            return self._calculator.spreading_factor
+
+    @property
+    def bandwidth(self):
+        with self._lock:
+            return self._calculator.bandwidth
+
+    @property
+    def coding_rate(self):
+        with self._lock:
+            return self._calculator.coding_rate
+
+    @property
+    def preamble_length(self):
+        with self._lock:
+            return self._calculator.preamble_length
+
+
+@dataclass
+class _BudgetState:
+    by_radio: dict
+    order: list
+    by_channel: dict
+    channel_of: dict
+    profile_backed: bool
+    default_radio_id: Optional[str]
+    default: _RadioAirtimeBudget
+
+
 class AirtimeBudgets:
     """The duty-cycle budgets a node meters against: one per channel.
 
@@ -164,22 +260,14 @@ class AirtimeBudgets:
 
     def __init__(self, config: dict):
         self.config = config
-        # radio_id -> manager, in configured order.
-        self._managers: dict = {}
-        self._order: list = []
-        # Channel key -> manager, and radio_id -> channel key. Both are how a
-        # rebuild works out what carries over to what.
-        self._by_channel: dict = {}
-        self._channel_of: dict = {}
-        self._profile_backed = False
-        self._default_manager: Optional[AirtimeManager] = None
-        self._build()
+        self._lock = threading.RLock()
+        self._state = self._build_state()
 
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
 
-    def _build(self) -> None:
+    def _build_state(self) -> _BudgetState:
         from .config import build_metering_profiles
 
         try:
@@ -188,49 +276,61 @@ class AirtimeBudgets:
             logger.warning("Could not read radio profiles for duty cycle: %s", exc)
             profiles = []
 
-        self._managers = {}
-        self._order = []
-        self._by_channel = {}
-        self._channel_of = {}
-        self._profile_backed = bool(profiles)
-
         if not profiles:
-            # Nothing to read: meter exactly as before, keyed on None so a packet
-            # with no radio id still finds it.
-            self._order = [None]
-            self._channel_of = {None: None}
-            manager = AirtimeManager(self.config)
-            self._managers = {None: manager}
-            self._by_channel = {None: manager}
-            self._default_manager = manager
-            return
+            ledger = AirtimeManager(self.config)
+            view = _RadioAirtimeBudget(ledger, ledger, self._lock)
+            return _BudgetState(
+                by_radio={None: view},
+                order=[None],
+                by_channel={None: ledger},
+                channel_of={None: None},
+                profile_backed=False,
+                default_radio_id=None,
+                default=view,
+            )
 
         shared = bool(self.config.get("duty_cycle", {}).get("shared_budget", False))
-        # One budget for every radio when asked for, otherwise one per channel:
-        # same frequency and bandwidth is the same channel.
+        order = []
+        channel_of = {}
         for profile in profiles:
             radio_id = str(profile["radio_id"])
-            self._order.append(radio_id)
-            self._channel_of[radio_id] = (
+            order.append(radio_id)
+            channel_of[radio_id] = (
                 "shared" if shared else (profile.get("frequency_hz"), profile.get("bandwidth_hz"))
             )
 
+        by_channel = {}
+        by_radio = {}
         for profile in profiles:
             radio_id = str(profile["radio_id"])
-            key = self._channel_of[radio_id]
-            manager = self._by_channel.get(key)
-            if manager is None:
-                manager = AirtimeManager(
+            key = channel_of[radio_id]
+            ledger = by_channel.get(key)
+            if ledger is None:
+                ledger = AirtimeManager(
                     self.config,
                     radio_config=self._air_settings(profile),
                     max_airtime_per_minute=self._channel_budget(
-                        [rid for rid, rid_key in self._channel_of.items() if rid_key == key]
+                        [rid for rid, rid_key in channel_of.items() if rid_key == key]
                     ),
                 )
-                self._by_channel[key] = manager
-            self._managers[radio_id] = manager
+                by_channel[key] = ledger
+            calculator = AirtimeManager(
+                self.config,
+                radio_config=self._air_settings(profile),
+                max_airtime_per_minute=ledger.max_airtime_per_minute,
+            )
+            by_radio[radio_id] = _RadioAirtimeBudget(ledger, calculator, self._lock)
 
-        self._default_manager = self._managers[self._default_radio_id()]
+        default_radio_id = self._default_radio_id(by_radio, order)
+        return _BudgetState(
+            by_radio=by_radio,
+            order=order,
+            by_channel=by_channel,
+            channel_of=channel_of,
+            profile_backed=True,
+            default_radio_id=default_radio_id,
+            default=by_radio[default_radio_id],
+        )
 
     def _air_settings(self, profile: dict) -> dict:
         """A profile in the shape AirtimeManager reads air settings from.
@@ -309,93 +409,68 @@ class AirtimeBudgets:
         prove it was the quiet one; a second refresh then finds each side's own
         key and stops there rather than doubling again.
         """
-        previous_channel_of = dict(self._channel_of)
-        previous_default = self._default_manager
-        snapshots = {
-            key: (
-                list(manager.tx_history),
-                manager.total_airtime_ms,
-                manager.total_rx_airtime_ms,
-            )
-            for key, manager in self._by_channel.items()
-        }
-
-        self._build()
-
-        for key, manager in self._by_channel.items():
-            sources = {
-                previous_channel_of[radio_id]
-                for radio_id, radio_key in self._channel_of.items()
-                if radio_key == key and radio_id in previous_channel_of
-            }
-            if not sources:
-                # A channel nothing was metering: a radio added, or one retuned
-                # onto a band the node was not using. An empty window on a node
-                # that has been transmitting would let the next minute's budget
-                # be spent twice, so it starts from the busiest channel the node
-                # was already keeping. The busiest single one, not the sum of
-                # them: summing is what turns repeated rebuilds into 100 -> 400
-                # -> 1600 ms and wedges transmission for the rest of the window.
-                busiest = max(
-                    snapshots.values(),
-                    key=lambda carried: sum(at for _, at in carried[0]),
-                    default=None,
+        with self._lock:
+            previous = self._state
+            snapshots = {
+                key: (
+                    list(manager.tx_history),
+                    manager.total_airtime_ms,
+                    manager.total_rx_airtime_ms,
                 )
-                if busiest is None:
-                    continue
-                carried_all = [busiest]
+                for key, manager in previous.by_channel.items()
+            }
+            rebuilt = self._build_state()
+
+            for key, manager in rebuilt.by_channel.items():
+                sources = {
+                    previous.channel_of[radio_id]
+                    for radio_id, radio_key in rebuilt.channel_of.items()
+                    if radio_key == key and radio_id in previous.channel_of
+                }
+                if not sources:
+                    busiest = max(
+                        snapshots.values(),
+                        key=lambda carried: sum(at for _, at in carried[0]),
+                        default=None,
+                    )
+                    if busiest is None:
+                        continue
+                    carried_all = [busiest]
+                else:
+                    carried_all = [snapshots[source] for source in sources]
+
+                history: list = []
+                total_tx = 0.0
+                total_rx = 0.0
+                for carried in carried_all:
+                    history.extend(carried[0])
+                    total_tx += carried[1]
+                    total_rx += carried[2]
+                manager.tx_history = sorted(history, key=lambda entry: entry[0])
+                manager.total_airtime_ms = total_tx
+                manager.total_rx_airtime_ms = total_rx
+
+            self._reuse_views(previous, rebuilt)
+            self._state = rebuilt
+
+    @staticmethod
+    def _reuse_views(previous: _BudgetState, rebuilt: _BudgetState) -> None:
+        """Keep radio handles valid across the atomic state swap."""
+        default_id = rebuilt.default_radio_id
+        for radio_id, new_view in list(rebuilt.by_radio.items()):
+            if radio_id == default_id:
+                old_view = previous.default
             else:
-                carried_all = [snapshots[source] for source in sources]
+                old_view = previous.by_radio.get(radio_id)
+                if old_view is previous.default:
+                    old_view = None
+            if old_view is None or old_view is new_view:
+                continue
+            old_view._replace(new_view._ledger, new_view._calculator)
+            rebuilt.by_radio[radio_id] = old_view
+        rebuilt.default = rebuilt.by_radio[default_id]
 
-            history: list = []
-            total_tx = 0.0
-            total_rx = 0.0
-            for carried in carried_all:
-                history.extend(carried[0])
-                total_tx += carried[1]
-                total_rx += carried[2]
-            manager.tx_history = sorted(history, key=lambda entry: entry[0])
-            manager.total_airtime_ms = total_tx
-            manager.total_rx_airtime_ms = total_rx
-
-        self._keep_default_identity(previous_default)
-
-    def _keep_default_identity(self, was_default: Optional[AirtimeManager]) -> None:
-        """Let the object that was the default manager go on being it.
-
-        Callers hold onto it: main.py hands it to NeighborScopeHelper at boot,
-        which keeps the reference for the life of the process. Replacing it with
-        a new object would leave that helper reading a manager nothing charges
-        any more, so it would see an empty window and stop throttling itself.
-        Adopt the rebuilt settings into the original object instead.
-
-        Takes the previous default as an argument rather than working it out
-        again: ``config`` is mutated in place by the daemon, so by the time this
-        runs ``fabric.default_radio`` may already name a different radio, and
-        recomputing would preserve the wrong object -- orphaning the one the
-        helper is holding, which is the failure this exists to prevent.
-        """
-        if was_default is None or self._default_manager is None:
-            return
-        rebuilt = self._default_manager
-        if rebuilt is was_default:
-            return
-
-        was_default.radio_config = rebuilt.radio_config
-        was_default.refresh_radio_params(rebuilt.radio_config)
-        was_default.max_airtime_per_minute = rebuilt.max_airtime_per_minute
-        was_default.tx_history = rebuilt.tx_history
-        was_default.total_airtime_ms = rebuilt.total_airtime_ms
-        was_default.total_rx_airtime_ms = rebuilt.total_rx_airtime_ms
-        for radio_id, manager in self._managers.items():
-            if manager is rebuilt:
-                self._managers[radio_id] = was_default
-        for key, manager in self._by_channel.items():
-            if manager is rebuilt:
-                self._by_channel[key] = was_default
-        self._default_manager = was_default
-
-    def _default_radio_id(self) -> Optional[str]:
+    def _default_radio_id(self, by_radio: dict, order: list) -> Optional[str]:
         """The radio Fabric transmits on by default.
 
         Mirrors build_radio_stack's rule -- ``fabric.default_radio`` when set,
@@ -406,22 +481,24 @@ class AirtimeBudgets:
         fabric = self.config.get("fabric")
         fabric = fabric if isinstance(fabric, dict) else {}
         configured = fabric.get("default_radio") or fabric.get("default_radio_id")
-        if configured and str(configured) in self._managers:
+        if configured and str(configured) in by_radio:
             return str(configured)
-        return self._order[0] if self._order else None
+        return order[0] if order else None
 
     # ------------------------------------------------------------------
     # Reading
     # ------------------------------------------------------------------
 
     @property
-    def default(self) -> AirtimeManager:
+    def default(self) -> _RadioAirtimeBudget:
         """The manager everything that reports one channel's figures reads."""
-        return self._default_manager
+        with self._lock:
+            return self._state.default
 
     @property
     def multi(self) -> bool:
-        return len(self._order) > 1
+        with self._lock:
+            return len(self._state.order) > 1
 
     @property
     def profile_backed(self) -> bool:
@@ -433,26 +510,36 @@ class AirtimeBudgets:
         what happens if a caller tests ``multi`` and takes the legacy path --
         undoes the whole point on every radio save from the web UI.
         """
-        return self._profile_backed
+        with self._lock:
+            return self._state.profile_backed
 
     def radio_ids(self) -> list:
         """Configured radio ids, in order. ``[None]`` when nothing was profiled."""
-        return list(self._order)
+        with self._lock:
+            return list(self._state.order)
 
-    def for_radio(self, radio_id: Optional[str]) -> AirtimeManager:
+    def shares_budget(self, first_radio_id: Optional[str], second_radio_id: Optional[str]) -> bool:
+        """Whether two radios debit the same channel ledger."""
+        with self._lock:
+            first = self.for_radio(first_radio_id)
+            second = self.for_radio(second_radio_id)
+            return first._ledger is second._ledger
+
+    def for_radio(self, radio_id: Optional[str]) -> _RadioAirtimeBudget:
         """The budget a send on this radio is charged to.
 
         An unknown id falls back to the default radio rather than going
         unmetered: an unrecognised label is a reason to be careful, not a reason
         to transmit freely.
         """
-        if radio_id is None:
-            return self.default
-        manager = self._managers.get(str(radio_id))
-        if manager is not None:
-            return manager
-        logger.debug("No duty-cycle budget for radio %s; metering on the default", radio_id)
-        return self.default
+        with self._lock:
+            if radio_id is None:
+                return self._state.default
+            manager = self._state.by_radio.get(str(radio_id))
+            if manager is not None:
+                return manager
+            logger.debug("No duty-cycle budget for radio %s; metering on the default", radio_id)
+            return self._state.default
 
     def per_radio_stats(self) -> list:
         """``[{radio_id, ...stats}]`` on a multi-radio node, else an empty list.
@@ -460,12 +547,14 @@ class AirtimeBudgets:
         Radios sharing a channel report the same figures, because they are the
         same budget: that is the statement, not a duplication.
         """
-        if not self.multi:
-            return []
-        return [
-            {"radio_id": radio_id, **self._managers[radio_id].get_stats()}
-            for radio_id in self._order
-        ]
+        with self._lock:
+            state = self._state
+            if len(state.order) <= 1:
+                return []
+            return [
+                {"radio_id": radio_id, **state.by_radio[radio_id].get_stats()}
+                for radio_id in state.order
+            ]
 
     def node_stats(self) -> dict:
         """One set of figures for the whole node, in AirtimeManager's shape.
@@ -485,15 +574,16 @@ class AirtimeBudgets:
 
         On a single-radio node every figure is that one manager's, unchanged.
         """
-        managers = list(self._by_channel.values())
-        if len(managers) == 1:
-            return managers[0].get_stats()
+        with self._lock:
+            managers = list(self._state.by_channel.values())
+            if len(managers) == 1:
+                return managers[0].get_stats()
 
-        stats = [manager.get_stats() for manager in managers]
-        return {
-            "current_airtime_ms": sum(s["current_airtime_ms"] for s in stats),
-            "max_airtime_ms": sum(s["max_airtime_ms"] for s in stats),
-            "utilization_percent": max(s["utilization_percent"] for s in stats),
-            "total_airtime_ms": sum(s["total_airtime_ms"] for s in stats),
-            "total_rx_airtime_ms": sum(s["total_rx_airtime_ms"] for s in stats),
-        }
+            stats = [manager.get_stats() for manager in managers]
+            return {
+                "current_airtime_ms": sum(s["current_airtime_ms"] for s in stats),
+                "max_airtime_ms": sum(s["max_airtime_ms"] for s in stats),
+                "utilization_percent": max(s["utilization_percent"] for s in stats),
+                "total_airtime_ms": sum(s["total_airtime_ms"] for s in stats),
+                "total_rx_airtime_ms": sum(s["total_rx_airtime_ms"] for s in stats),
+            }

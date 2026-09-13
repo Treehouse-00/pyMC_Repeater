@@ -163,17 +163,9 @@ class ConfigManager:
             return
 
         budgets = getattr(repeater_handler, "airtime_budgets", None)
-        if budgets is not None and getattr(budgets, "profile_backed", False):
-            # Each radio meters on its own modulation, so rebuild them all from
-            # the config rather than overwriting the default radio's profile
-            # with the top-level block it does not use.
-            #
-            # Tested on profile_backed, not on how many radios there are: a node
-            # with one radios[] entry has that entry's own bandwidth and its own
-            # band's limit, and the legacy branch below would overwrite them with
-            # the top-level block on every radio save from the web UI -- a
-            # 62.5 kHz radio silently metered at 500 kHz from the first save
-            # until the next restart.
+        if budgets is not None:
+            # Rebuild the container even on a legacy single-radio node because
+            # it owns both the cached modulation and the cached duty-cycle limit.
             budgets.refresh()
             repeater_handler.airtime_mgr = budgets.default
             return
@@ -430,11 +422,17 @@ class ConfigManager:
                 logger.info("radio_type change detected; service restart required")
                 live_update_ok = False
 
+            if "radios" in sections:
+                logger.info("Non-default radio change detected; service restart required")
+                live_update_ok = False
+
             if "kiss" in sections and self._kiss_transport_restart_required():
                 live_update_ok = False
 
             if "radio" in sections:
                 live_update_ok = self._apply_live_radio_config() and live_update_ok
+            elif "duty_cycle" in sections:
+                self._refresh_airtime_radio_params()
 
             if "http" in sections:
                 live_update_ok = self._apply_live_http_config() and live_update_ok

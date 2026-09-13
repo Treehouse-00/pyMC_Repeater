@@ -2634,6 +2634,69 @@ def test_update_radio_config_owner_info_and_mesh_fields(cherrypy_ctx):
     assert "owner.info" in out["data"].get("applied", [])
 
 
+def test_update_non_default_radio_requires_restart(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.json = {"radio_id": "link", "bandwidth": 500000}
+    api = _make_api(
+        {
+            "radio": {"bandwidth": 62500},
+            "radios": [
+                {"id": "local", "radio": {"bandwidth": 62500}},
+                {"id": "link", "radio": {"bandwidth": 62500}},
+            ],
+            "fabric": {"default_radio": "local"},
+            "repeater": {},
+            "delays": {},
+        }
+    )
+    api.config_manager.update_and_save.return_value = {
+        "success": True,
+        "saved": True,
+        "live_updated": False,
+    }
+
+    out = api.update_radio_config()
+
+    assert out["success"] is True
+    assert out["data"]["restart_required"] is True
+    sections = api.config_manager.update_and_save.call_args.kwargs["live_update_sections"]
+    assert "radios" in sections
+    assert "radio" not in sections
+
+
+def test_update_radio_without_id_keeps_the_fabric_default_entry_in_sync(cherrypy_ctx):
+    request, _ = cherrypy_ctx
+    request.method = "POST"
+    request.json = {"bandwidth": 500000}
+    api = _make_api(
+        {
+            "radio": {"bandwidth": 62500},
+            "radios": [
+                {"id": "local", "radio": {"bandwidth": 62500}},
+                {"id": "link", "radio": {"bandwidth": 62500}},
+            ],
+            "fabric": {"default_radio": "local"},
+            "repeater": {},
+            "delays": {},
+        }
+    )
+    api.config_manager.update_and_save.return_value = {
+        "success": True,
+        "saved": True,
+        "live_updated": True,
+    }
+
+    out = api.update_radio_config()
+
+    assert out["success"] is True
+    assert api.config["radio"]["bandwidth"] == 500000
+    assert api.config["radios"][0]["radio"]["bandwidth"] == 500000
+    sections = api.config_manager.update_and_save.call_args.kwargs["live_update_sections"]
+    assert "radio" in sections
+    assert "radios" not in sections
+
+
 class _FakeIdentityObj:
     def __init__(self, first=0x42):
         self._pk = bytes([first]) + (b"A" * 31)

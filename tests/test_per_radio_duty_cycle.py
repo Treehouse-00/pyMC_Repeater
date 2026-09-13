@@ -8,6 +8,7 @@ manager charging both at one modulation is wrong in both directions at once.
 from __future__ import annotations
 
 import copy
+import threading
 from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -108,16 +109,29 @@ def test_radios_on_one_channel_share_a_budget():
     same = [_radio("north", WIDE), _radio("south", WIDE)]
     budgets = AirtimeBudgets(_config(same))
 
-    assert budgets.for_radio("north") is budgets.for_radio("south")
+    assert budgets.shares_budget("north", "south")
 
     budgets.for_radio("north").record_tx(3600)
     assert budgets.for_radio("south").can_transmit(10)[0] is False
 
 
+def test_radios_on_one_channel_keep_their_own_modulation():
+    slow = dict(WIDE, spreading_factor=12)
+    budgets = AirtimeBudgets(_config([_radio("fast", WIDE), _radio("slow", slow)]))
+
+    assert budgets.shares_budget("fast", "slow")
+    assert budgets.for_radio("slow").calculate_airtime(50) > budgets.for_radio(
+        "fast"
+    ).calculate_airtime(50)
+
+
 def test_shared_budget_restores_one_allowance_for_the_whole_node():
     budgets = AirtimeBudgets(_config(BRIDGE, shared_budget=True))
 
-    assert budgets.for_radio("local") is budgets.for_radio("link")
+    assert budgets.shares_budget("local", "link")
+    assert budgets.for_radio("link").calculate_airtime(50) == pytest.approx(
+        budgets.for_radio("local").calculate_airtime(50) * 8, rel=0.05
+    )
 
     budgets.for_radio("link").record_tx(3600)
     assert budgets.for_radio("local").can_transmit(10)[0] is False
@@ -689,7 +703,7 @@ def test_radios_merging_onto_one_channel_sum_what_they_spent():
     config["radios"][1]["radio"] = dict(WIDE)  # link retuned onto local's channel
     budgets.refresh()
 
-    assert budgets.for_radio("local") is budgets.for_radio("link")
+    assert budgets.shares_budget("local", "link")
     assert budgets.for_radio("local").get_stats()["current_airtime_ms"] == 3600
     assert budgets.for_radio("local").can_transmit(10)[0] is False
 
@@ -808,7 +822,7 @@ def test_an_unprofilable_radio_is_metered_on_the_top_level_block():
 
     budgets = AirtimeBudgets(config)
 
-    assert budgets.for_radio("link") is budgets.for_radio("local")
+    assert budgets.shares_budget("link", "local")
     assert budgets.for_radio("link").bandwidth == WIDE["bandwidth"]
 
 
@@ -844,6 +858,34 @@ def test_a_rebuild_is_idempotent_for_an_unchanged_config():
     assert budgets.for_radio("local").get_stats()["current_airtime_ms"] == 0
 
 
+def test_readers_cannot_observe_a_partially_rebuilt_state(monkeypatch):
+    budgets = AirtimeBudgets(_config(BRIDGE))
+    build_started = threading.Event()
+    release_build = threading.Event()
+    read_finished = threading.Event()
+    original_build = budgets._build_state
+
+    def paused_build():
+        build_started.set()
+        assert release_build.wait(timeout=2)
+        return original_build()
+
+    monkeypatch.setattr(budgets, "_build_state", paused_build)
+    refresh_thread = threading.Thread(target=budgets.refresh)
+    refresh_thread.start()
+    assert build_started.wait(timeout=2)
+
+    read_thread = threading.Thread(target=lambda: (budgets.node_stats(), read_finished.set()))
+    read_thread.start()
+    assert not read_finished.wait(timeout=0.05)
+
+    release_build.set()
+    refresh_thread.join(timeout=2)
+    read_thread.join(timeout=2)
+    assert not refresh_thread.is_alive()
+    assert read_finished.is_set()
+
+
 def test_a_new_radio_starts_from_the_busiest_channel_not_the_sum_of_them():
     config = _config([_radio("local", WIDE), _radio("link", NARROW)])
     budgets = AirtimeBudgets(config)
@@ -872,6 +914,8 @@ def test_changing_the_default_radio_keeps_the_manager_captured_at_boot():
     assert budgets.default is captured
     assert budgets.for_radio("link") is captured
     assert captured.bandwidth == NARROW["bandwidth"]
+    assert not budgets.shares_budget("local", "link")
+    assert budgets.for_radio("local").bandwidth == WIDE["bandwidth"]
 
 
 def test_the_captured_manager_still_receives_what_is_charged_to_it():

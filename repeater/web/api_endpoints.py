@@ -4905,26 +4905,41 @@ class APIEndpoints:
             if "mesh" not in self.config:
                 self.config["mesh"] = {}
 
-            # Optional multi-radio target. When radios[] exists and radio_id is
-            # provided, LoRa air settings are written into that entry's radio{}
-            # instead of (or in addition to) the legacy top-level radio{}.
+            # A Fabric edit targets the named radio, or its default when the old
+            # single-radio request shape omits radio_id.
             target_radio_id = data.get("radio_id")
             radios_list = self.config.get("radios")
             target_radio_cfg = self.config["radio"]
             target_entry = None
-            if isinstance(radios_list, list) and target_radio_id:
+            target_is_default = False
+            effective_target_id = target_radio_id
+            if isinstance(radios_list, list) and radios_list:
+                fabric = (
+                    self.config.get("fabric") if isinstance(self.config.get("fabric"), dict) else {}
+                )
+                default_id = fabric.get("default_radio") or fabric.get("default_radio_id")
+                if default_id is None:
+                    first = radios_list[0] if isinstance(radios_list[0], dict) else {}
+                    default_id = first.get("id") or first.get("radio_id")
+                if effective_target_id is None:
+                    effective_target_id = default_id
+
+            if isinstance(radios_list, list) and effective_target_id:
                 for entry in radios_list:
                     if not isinstance(entry, dict):
                         continue
                     rid = entry.get("id") or entry.get("radio_id")
-                    if str(rid) == str(target_radio_id):
+                    if str(rid) == str(effective_target_id):
                         target_entry = entry
                         if not isinstance(entry.get("radio"), dict):
                             entry["radio"] = {}
                         target_radio_cfg = entry["radio"]
                         break
                 if target_entry is None:
-                    return self._error(f"Unknown radio_id={target_radio_id!r}")
+                    return self._error(f"Unknown radio_id={effective_target_id!r}")
+                target_is_default = default_id is not None and str(default_id) == str(
+                    effective_target_id
+                )
 
             def _set_radio_param(key, value):
                 target_radio_cfg[key] = value
@@ -4932,21 +4947,10 @@ class APIEndpoints:
                 # radio or when no radios[] list is active.
                 if target_entry is None:
                     self.config["radio"][key] = value
-                else:
-                    default_id = None
-                    fabric = (
-                        self.config.get("fabric")
-                        if isinstance(self.config.get("fabric"), dict)
-                        else {}
-                    )
-                    default_id = fabric.get("default_radio") or fabric.get("default_radio_id")
-                    if default_id is None and radios_list:
-                        first = radios_list[0] if isinstance(radios_list[0], dict) else {}
-                        default_id = first.get("id") or first.get("radio_id")
-                    if default_id is not None and str(default_id) == str(target_radio_id):
-                        if "radio" not in self.config or not isinstance(self.config["radio"], dict):
-                            self.config["radio"] = {}
-                        self.config["radio"][key] = value
+                elif target_is_default:
+                    if "radio" not in self.config or not isinstance(self.config["radio"], dict):
+                        self.config["radio"] = {}
+                    self.config["radio"][key] = value
 
             # Update TX power (up to 30 dBm for high-power radios)
             if "tx_power" in data:
@@ -5115,8 +5119,18 @@ class APIEndpoints:
             if not applied:
                 return self._error("No valid settings provided")
 
-            live_sections = ["repeater", "delays", "radio"]
-            if target_entry is not None:
+            live_sections = ["repeater", "delays"]
+            radio_fields = {
+                "tx_power",
+                "frequency",
+                "bandwidth",
+                "spreading_factor",
+                "coding_rate",
+            }
+            radio_changed = any(field in data for field in radio_fields)
+            if radio_changed and (target_entry is None or target_is_default):
+                live_sections.append("radio")
+            elif radio_changed:
                 live_sections.append("radios")
             if "mesh" in self.config and any(k in data for k in ("path_hash_mode", "loop_detect")):
                 live_sections.append("mesh")
