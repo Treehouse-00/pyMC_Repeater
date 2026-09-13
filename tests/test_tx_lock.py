@@ -61,6 +61,11 @@ def _make_handler():
     h.airtime_mgr = MagicMock()
     h.airtime_mgr.can_transmit.return_value = (True, 0.0)
     h.airtime_mgr.calculate_airtime.return_value = 100.0
+    # Every radio meters through the same manager here, so these tests keep
+    # asserting on one budget while the engine reaches it per egress.
+    h.airtime_budgets = MagicMock()
+    h.airtime_budgets.default = h.airtime_mgr
+    h.airtime_budgets.for_radio.return_value = h.airtime_mgr
     h._tx_lock = asyncio.Lock()
     h._recent_own_tx = OrderedDict()
     h.sent_flood_count = 0

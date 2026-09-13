@@ -15,6 +15,31 @@ from .storage_utils import PacketRecord
 logger = logging.getLogger("StorageCollector")
 
 
+def _node_airtime_stats(repeater_handler) -> Optional[dict]:
+    """The whole node's airtime figures, however old the handler is.
+
+    Prefers ``airtime_stats()``, which sums the channels a multi-radio node
+    meters separately. Falls back to the default radio's manager for a handler
+    that predates it, and to None when there is no handler at all.
+    """
+    if repeater_handler is None:
+        return None
+    node_stats = getattr(repeater_handler, "airtime_stats", None)
+    if callable(node_stats):
+        try:
+            return node_stats()
+        except Exception as exc:
+            logger.debug(f"Node airtime stats unavailable: {exc}")
+    airtime_mgr = getattr(repeater_handler, "airtime_mgr", None)
+    if airtime_mgr is None:
+        return None
+    try:
+        return airtime_mgr.get_stats()
+    except Exception as exc:
+        logger.debug(f"Airtime stats unavailable: {exc}")
+        return None
+
+
 class StorageCollector:
     def __init__(self, config: dict, local_identity=None, repeater_handler=None):
         self.config = config
@@ -164,8 +189,9 @@ class StorageCollector:
 
         uptime_secs = int(time.time() - self.repeater_handler.start_time)
 
-        # Get airtime stats
-        airtime_stats = self.repeater_handler.airtime_mgr.get_stats()
+        # Get airtime stats -- the node's, not the default radio's channel, so
+        # a bridge's stored history covers every radio it transmits on.
+        airtime_stats = _node_airtime_stats(self.repeater_handler) or {}
 
         # Get latest noise floor from database
         noise_floor = None
@@ -295,11 +321,9 @@ class StorageCollector:
             ),
             "mode": self.config.get("repeater", {}).get("mode", "forward"),
         }
-        airtime_mgr = getattr(self.repeater_handler, "airtime_mgr", None)
-        if airtime_mgr is not None:
-            airtime_stats = airtime_mgr.get_stats()
-            if airtime_stats:
-                system_stats["utilization_percent"] = airtime_stats["utilization_percent"]
+        airtime_stats = _node_airtime_stats(self.repeater_handler)
+        if airtime_stats:
+            system_stats["utilization_percent"] = airtime_stats["utilization_percent"]
         if self._last_noise_floor_dbm is not None:
             system_stats["noise_floor_dbm"] = self._last_noise_floor_dbm
         if self.advert_stats_getter is not None:

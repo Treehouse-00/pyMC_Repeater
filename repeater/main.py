@@ -1582,7 +1582,10 @@ class RepeaterDaemon:
         if not self.repeater_handler:
             return {}
         engine = self.repeater_handler
-        airtime = engine.airtime_mgr.get_stats()
+        # The node's airtime, not the default radio's channel: a bridge reports
+        # the time it spent on air, however many radios it spent it on.
+        airtime_stats = getattr(engine, "airtime_stats", None)
+        airtime = airtime_stats() if callable(airtime_stats) else engine.airtime_mgr.get_stats()
         uptime_secs = int(time.time() - engine.start_time)
         queue_len = 0
         for bridge in getattr(self, "companion_bridges", {}).values():

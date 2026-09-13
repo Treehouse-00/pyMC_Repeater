@@ -34,8 +34,8 @@ from openhop_core.protocol.packet_utils import (
     packet_score,
 )
 
-from repeater.airtime import AirtimeManager
-from repeater.config import fabric_origin_tx
+from repeater.airtime import AirtimeBudgets
+from repeater.config import fabric_origin_tx, fabric_selects_by_ingress_radio
 from repeater.data_acquisition import StorageCollector
 from repeater.modem_config import normalize_modem_config, redact_modem_tokens_in_place
 from repeater.neighbour_links import NeighbourLinkTracker
@@ -178,7 +178,11 @@ class RepeaterHandler(BaseHandler):
         self.local_hash_bytes = local_hash_bytes or bytes([local_hash])
         self.send_advert_func = send_advert_func
         self.periodic_advert_tick_func = periodic_advert_tick_func
-        self.airtime_mgr = AirtimeManager(config)
+        # One budget per channel; on a single-radio node this is the one manager
+        # it always had. airtime_mgr stays the default radio's, because
+        # everything that reports a single utilisation figure reads it.
+        self.airtime_budgets = AirtimeBudgets(config)
+        self.airtime_mgr = self.airtime_budgets.default
         self.policy_engine = PolicyEngine.from_runtime_config(config)
         self.seen_packets = OrderedDict()
         self.cache_ttl = max(
@@ -307,8 +311,9 @@ class RepeaterHandler(BaseHandler):
             elif route_type in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT):
                 self.recv_direct_count += 1
             try:
-                rx_airtime_ms = self.airtime_mgr.calculate_airtime(packet.get_raw_length())
-                self.airtime_mgr.record_rx(rx_airtime_ms)
+                rx_mgr = self.airtime_budgets.for_radio(self._rx_radio_id_of(packet, metadata))
+                rx_airtime_ms = rx_mgr.calculate_airtime(packet.get_raw_length())
+                rx_mgr.record_rx(rx_airtime_ms)
             except Exception as exc:
                 logger.debug(f"Failed to record RX airtime: {exc}")
 
@@ -454,6 +459,22 @@ class RepeaterHandler(BaseHandler):
             # A fan-out decides send-time normalisation (flood scope, hash mode)
             # up front; do it before metering so every duty-cycle gate sees the
             # bytes that actually go on air.
+            if tx_radio_ids is None:
+                # Nothing above named an egress, so the fabric picks one inside
+                # send(). Ask it now, with this packet's own ingress radio, and
+                # keep the answer: on a core that passes the ingress radio to
+                # the selector the answer is a function of the packet, so it is
+                # the same answer send() would reach and nothing moves on the
+                # air. What it buys is that the duty cycle is charged to the
+                # channel that carries the packet instead of to whichever radio
+                # the node lists first. An older core cannot answer, and
+                # tx_radio_ids stays None: the fabric goes on choosing at send
+                # time and the gate holds every radio it could pick to its own
+                # budget.
+                planned = self._planned_egress_radio_id(fwd_pkt, rx_radio_id)
+                if planned is not None:
+                    tx_radio_ids = (planned,)
+
             fanout = bool(tx_radio_ids) and len(tx_radio_ids) > 1
             extra_tx_tasks = []
             for extra_pkt, extra_delay in getattr(result, "extras", ()):
@@ -474,7 +495,10 @@ class RepeaterHandler(BaseHandler):
                 self._freeze_tx_normalisation(fwd_pkt)
             airtime_ms = self.airtime_mgr.calculate_airtime(fwd_pkt.get_raw_length())
 
-            can_tx, wait_time = self.airtime_mgr.can_transmit(airtime_ms)
+            # Advisory, and asked of the radios this packet is headed for: one
+            # radio being over budget is no reason to drop a forward the other
+            # can carry. The authoritative gate is per egress, under the TX lock.
+            can_tx, wait_time = self._egress_can_transmit(fwd_pkt, tx_radio_ids)
 
             # LBT metadata (set after any TX path that awaits send)
             tx_metadata = None
@@ -1008,7 +1032,14 @@ class RepeaterHandler(BaseHandler):
         try:
             raw_len = packet.get_raw_length() if hasattr(packet, "get_raw_length") else 0
             if raw_len > 0:
-                airtime_ms = float(self.airtime_mgr.calculate_airtime(raw_len))
+                # The radio that carried it: as heard, else as first sent. On a
+                # bridge the same bytes are a different time on air per radio, so
+                # a figure computed on another radio's modulation describes a
+                # transmission that never happened.
+                carrier = rx_radio_id or getattr(packet, "_rx_radio_id", None) or tx_radio_id
+                airtime_ms = float(
+                    self.airtime_budgets.for_radio(carrier).calculate_airtime(raw_len)
+                )
         except Exception as e:
             logger.debug(f"Could not compute airtime for packet record: {e}")
 
@@ -1829,14 +1860,38 @@ class RepeaterHandler(BaseHandler):
                     # record_tx() are effectively atomic — no TOCTOU window.
                     # Re-checked every attempt because airtime state may change
                     # while we wait for the lock or sleep through backoff.
+                    # Charged to the radio this egress goes out on, at that
+                    # radio's modulation: the airtime the caller computed is the
+                    # default radio's, which on a bridge is the wrong channel and
+                    # can be out by the ratio of their bandwidths.
+                    #
+                    # A named radio is gated on its own budget. Without one the
+                    # fabric picks inside send(), so every radio it could pick
+                    # has to have the budget -- a gate that passes because some
+                    # other channel is quiet is a gate that lets this one
+                    # transmit past its legal limit.
                     if airtime_ms > 0:
-                        can_tx_now, _ = self.airtime_mgr.can_transmit(airtime_ms)
-                        if not can_tx_now:
-                            logger.warning(
-                                "Packet dropped at TX time: duty-cycle exceeded (airtime=%.1fms)",
-                                airtime_ms,
-                            )
-                            return False
+                        gate_ids = (
+                            (preferred_tx_radio_id,)
+                            if preferred_tx_radio_id
+                            else self._egress_candidates()
+                        )
+                        for gate_id in gate_ids:
+                            manager = self.airtime_budgets.for_radio(gate_id)
+                            try:
+                                gate_ms = self._egress_radio_airtime(fwd_pkt, gate_id)
+                            except Exception as exc:
+                                logger.debug(f"Falling back to the caller's airtime: {exc}")
+                                gate_ms = airtime_ms
+                            can_tx_now, _ = manager.can_transmit(gate_ms)
+                            if not can_tx_now:
+                                logger.warning(
+                                    "Packet dropped at TX time: duty-cycle exceeded on radio %s "
+                                    "(airtime=%.1fms)",
+                                    gate_id or "default",
+                                    gate_ms,
+                                )
+                                return False
 
                     # Registered as the send starts: another radio of this node can
                     # hear it while it is still on the air.
@@ -1865,12 +1920,24 @@ class RepeaterHandler(BaseHandler):
                                 continue
                             return False
                         self._record_packet_sent(fwd_pkt)
+                        charge_ms = airtime_ms
                         if airtime_ms > 0:
-                            self.airtime_mgr.record_tx(airtime_ms)
+                            # Debited under the same lock the gate ran under, so
+                            # there is no window between deciding and recording.
+                            # Charged to the radio the send says carried it,
+                            # which is the only way to meter a fabric that chose
+                            # for itself -- and still the right answer when the
+                            # radio was named, since it is the radio confirming.
+                            try:
+                                charge_ms = self._charge_egress(fwd_pkt, preferred_tx_radio_id)
+                            except Exception as exc:
+                                logger.debug(f"Falling back to the caller's airtime: {exc}")
+                                self.airtime_budgets.for_radio(preferred_tx_radio_id).record_tx(
+                                    airtime_ms
+                                )
                         packet_size = fwd_pkt.get_raw_length()
                         logger.info(
-                            f"Retransmitted packet ({packet_size} bytes, "
-                            f"{airtime_ms:.1f}ms airtime)"
+                            f"Retransmitted packet ({packet_size} bytes, {charge_ms:.1f}ms airtime)"
                         )
                         return True
                     except Exception as e:
@@ -2042,6 +2109,152 @@ class RepeaterHandler(BaseHandler):
         metadata = metadata if isinstance(metadata, dict) else None
         radio_id = (metadata.get("radio_id") or metadata.get("tx_radio_id")) if metadata else None
         return FanoutTxResult([RadioTxResult(radio_id, bool(outcome), metadata=metadata)])
+
+    @staticmethod
+    def _rx_radio_id_of(packet: Packet, metadata: Optional[dict]) -> Optional[str]:
+        """The radio that heard this packet, however the caller carried the id."""
+        if metadata:
+            radio_id = metadata.get("rx_radio_id")
+            if radio_id:
+                return radio_id
+        return getattr(packet, "_rx_radio_id", None) or getattr(packet, "rx_radio_id", None)
+
+    def _egress_radio_airtime(self, packet: Packet, radio_id: Optional[str]) -> float:
+        """Time this packet will occupy the channel of the radio sending it.
+
+        On a bridge the same bytes are a different length of transmission on each
+        radio -- eight times over between 500 and 62.5 kHz -- so the figure the
+        duty cycle is charged has to be the one for the radio that transmits.
+        """
+        return self.airtime_budgets.for_radio(radio_id).calculate_airtime(packet.get_raw_length())
+
+    def airtime_stats(self) -> dict:
+        """Node-wide airtime figures, in the shape AirtimeManager.get_stats returns.
+
+        The single place for callers that report one set of numbers for the
+        node. Reading ``airtime_mgr`` instead describes the default radio's
+        channel only, which on a bridge is a quiet halving of figures people
+        have been watching for months.
+        """
+        return self.airtime_budgets.node_stats()
+
+    def _egress_can_transmit(
+        self, packet: Packet, tx_radio_ids: Optional[Tuple[str, ...]]
+    ) -> Tuple[bool, float]:
+        """Advisory gate before scheduling: is there budget for this forward?
+
+        With a named egress set, each radio is sent to separately and re-gated
+        under the TX lock, so one radio being over budget is no reason to drop a
+        forward another can carry -- one radio with budget is enough, and the
+        wait reported is the shortest of them.
+
+        With no named set the fabric picks inside send() and the node cannot
+        know which channel will carry the packet. Then every radio it could pick
+        has to have the budget, and the wait is the longest of them. Asking
+        whether *any* candidate has budget is exactly how a node transmits past
+        a legal limit: it only has to guess the quiet channel.
+        """
+        if tx_radio_ids:
+            waits = []
+            for radio_id in tx_radio_ids:
+                manager = self.airtime_budgets.for_radio(radio_id)
+                can_tx, wait_time = manager.can_transmit(
+                    self._egress_radio_airtime(packet, radio_id)
+                )
+                if can_tx:
+                    return True, 0.0
+                waits.append(wait_time)
+            return False, min(waits) if waits else 1.0
+
+        waits = []
+        for radio_id in self._egress_candidates():
+            manager = self.airtime_budgets.for_radio(radio_id)
+            can_tx, wait_time = manager.can_transmit(self._egress_radio_airtime(packet, radio_id))
+            if not can_tx:
+                waits.append(wait_time)
+        if waits:
+            return False, max(waits)
+        return True, 0.0
+
+    def _charge_egress(self, packet: Packet, preferred_tx_radio_id: Optional[str]) -> float:
+        """Debit the radio that actually carried the packet, and say how much.
+
+        The metadata a send returns names the endpoint that transmitted, and
+        that is the authoritative answer: where the fabric chose inside send()
+        it is the only way to find out, and where the radio was named explicitly
+        it is the radio confirming it. Falls back to the radio that was asked
+        for, and from there to the default budget, so a send always lands
+        somewhere rather than going unmetered.
+        """
+        metadata = getattr(packet, "_tx_metadata", None)
+        radio_id = None
+        if isinstance(metadata, dict):
+            radio_id = metadata.get("radio_id") or metadata.get("tx_radio_id")
+        radio_id = str(radio_id) if radio_id else preferred_tx_radio_id
+        manager = self.airtime_budgets.for_radio(radio_id)
+        charge_ms = self._egress_radio_airtime(packet, radio_id)
+        manager.record_tx(charge_ms)
+        return charge_ms
+
+    def _planned_egress_radio_id(self, packet: Packet, rx_radio_id: Optional[str]) -> Optional[str]:
+        """Ask the fabric which radio will carry this packet, before it is sent.
+
+        Answerable only on a core that passes the ingress radio to the TX
+        selector. There the choice is a function of the arguments, so the answer
+        now is the answer send() reaches, and naming it changes nothing about
+        which radio transmits -- it only lets the duty cycle be charged to the
+        channel that carries the packet, and closes the window where a busy
+        node's next arrival moves a reply onto the other band between the
+        retransmit delay and the send.
+
+        Returns None on a node with fewer than two radios, where there is
+        nothing to choose, and against an older core, where the fabric picks
+        inside send() and no caller can know in advance what it will pick.
+
+        The bytes handed to the selector are this packet as it stands, a moment
+        before the dispatcher applies flood scope and path-hash normalisation,
+        so a selector that routed on payload content could in principle see a
+        slightly different frame than the one sent. The tx_mode selectors route
+        on the ingress radio and ignore the bytes entirely.
+        """
+        fabric, ids = self._fabric_endpoints()
+        if fabric is None or not ids or len(ids) < 2:
+            return None
+        if not fabric_selects_by_ingress_radio(fabric):
+            return None
+        try:
+            raw = packet.write_to()
+        except Exception as exc:
+            logger.debug(f"Could not serialise a packet to resolve its egress radio: {exc}")
+            return None
+        try:
+            radio_id = fabric.resolve_tx_radio_id(raw, None, rx_radio_id=rx_radio_id)
+        except Exception as exc:
+            logger.debug(f"Fabric could not name an egress radio: {exc}")
+            return None
+        return str(radio_id) if radio_id else None
+
+    def _egress_candidates(self) -> Tuple[Optional[str], ...]:
+        """Every radio the fabric could pick when nobody named one.
+
+        The honest answer on a core whose selector sees only the frame bytes:
+        it reads the node's most recent RX inside send(), so sticky and bridge
+        can both come out on any radio. tx_mode default always picks
+        default_radio, so that one is still exact.
+
+        ``(None,)`` on a single-radio node, which resolves to the one budget it
+        has always had.
+        """
+        fabric, ids = self._fabric_endpoints()
+        if fabric is None or not ids or len(ids) < 2:
+            return (None,)
+        mode = str(self._fabric_cfg().get("tx_mode", "default")).strip().lower()
+        if mode in ("", "default"):
+            default_id = getattr(fabric, "default_radio_id", None)
+            if isinstance(default_id, str) and default_id in ids:
+                return (default_id,)
+            return (ids[0],)
+        return tuple(ids)
 
     def _fabric_cfg(self) -> dict:
         fabric_cfg = self.config.get("fabric")
@@ -2278,7 +2491,15 @@ class RepeaterHandler(BaseHandler):
             "public_key": None,
         }
         # Add airtime stats
-        stats.update(self.airtime_mgr.get_stats())
+        # The node-wide figures describe the whole node: totals summed across
+        # channels, utilisation the highest of them. Each channel's own budget
+        # is reported beside them, because on a bridge they are different
+        # limits, differently spent. On a single-radio node every figure is the
+        # one manager's, unchanged.
+        stats.update(self.airtime_budgets.node_stats())
+        radios = self.airtime_budgets.per_radio_stats()
+        if radios:
+            stats["airtime_radios"] = radios
         return stats
 
     def _start_background_tasks(self):

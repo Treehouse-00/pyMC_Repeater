@@ -30,6 +30,7 @@ from openhop_core.protocol.packet_filter import PacketFilter
 from openhop_core.protocol.transport_keys import get_auto_key_for
 from openhop_core.rf_fabric import FabricRadio
 
+from repeater.config import _apply_fabric_tx_mode
 from repeater.engine import FanoutTxResult, RadioTxResult, RepeaterHandler
 from repeater.packet_router import PacketRouter
 from repeater.policy_engine import PolicyEngine
@@ -123,6 +124,11 @@ class _Rig:
             radios=[(self.local, "local"), (self.link, "link")],
             default_radio_id=cfg["fabric"]["default_radio"],
         )
+        # build_radio_stack binds the tx_mode selector; a rig that skips it runs
+        # every test on a fabric that has no TX policy at all, which is how an
+        # on-air change in where locally originated packets leave by went
+        # unnoticed through two reviews.
+        _apply_fabric_tx_mode(self.radio.fabric, cfg["fabric"].get("tx_mode", "default"))
         self.dispatcher = Dispatcher(radio=self.radio, packet_filter=PacketFilter())
 
         # Every Packet object handed to the dispatcher, with its target radio.
@@ -544,7 +550,9 @@ async def test_local_origin_default_mode_keeps_single_fabric_send():
     rig = _Rig({"repeat_on_ingress": True})  # origin_tx defaults to "default"
     assert await rig.handler(_flood(), {}, local_transmission=True) is True
     assert rig.air.order == ["local"]
-    assert rig.sent_radio_ids == [None]  # the fabric picks, as before
+    # Same radio on the air as when the fabric chose at send time; the engine now
+    # names it instead, so the duty cycle can be charged to the right channel.
+    assert rig.sent_radio_ids == ["local"]
     assert rig.records()[-1]["tx_radio_ids"] == ["local"]
 
 

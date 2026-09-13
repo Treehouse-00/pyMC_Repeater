@@ -1,6 +1,8 @@
 import base64
+import inspect
 import logging
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, overload
 
@@ -792,45 +794,123 @@ def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
     return merged
 
 
+@lru_cache(maxsize=32)
+def _names_rx_radio_id(func) -> bool:
+    """Signature check, cached: this runs once per forwarded packet."""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C callables and stubs
+        return False
+    param = params.get("rx_radio_id")
+    return param is not None and param.kind is not inspect.Parameter.POSITIONAL_ONLY
+
+
+def fabric_selects_by_ingress_radio(fabric) -> bool:
+    """Whether this openhop_core hands a TX selector the frame's ingress radio.
+
+    The keyword is named in ``resolve_tx_radio_id``'s signature from the release
+    that added it, and absent before, so the signature is the version check.
+    Everything downstream of this -- which selector gets registered, and whether
+    the duty-cycle gate can name the egress radio before the send -- follows
+    from the answer, so a node running an older core keeps working exactly as it
+    did rather than failing on a keyword nothing accepts.
+    """
+    resolve = getattr(fabric, "resolve_tx_radio_id", None)
+    if resolve is None:
+        return False
+    # Cached on the underlying function, which is per class rather than per
+    # fabric, so a long-running node does not rebuild a Signature per packet.
+    return _names_rx_radio_id(getattr(resolve, "__func__", resolve))
+
+
 def _apply_fabric_tx_mode(fabric, mode: str) -> None:
     """Map simple tx_mode strings onto RFFabric.set_tx_selector.
 
     Modes:
     - default: always TX ``default_radio`` (or first registered).
-    - sticky:  TX on the radio that last received (reply on same band).
-    - bridge:  TX on a *different* radio than last RX (dual-freq backhaul).
-               Designed for two radios (local <-> link). With 3+ radios, uses
-               the first other id in registration order. With no prior RX,
-               falls back to default_radio.
+    - sticky:  TX on the radio that received this packet (reply on same band).
+    - bridge:  TX on a *different* radio than the one that received this packet
+               (dual-freq backhaul). Designed for two radios (local <-> link).
+               With 3+ radios, uses the first other id in registration order.
+
+    What "this packet" means depends on the core underneath, and the difference
+    is worth stating plainly.
+
+    A core that passes the ingress radio to the selector gets selectors that
+    route by it: the answer is a function of the packet, so it is the same
+    whenever it is asked, and the repeater can ask before the send to know which
+    channel to charge. A packet this node originated has no ingress radio and
+    goes out on ``default_radio``.
+
+    An older core passes only the frame bytes, so the selector reads the
+    fabric's most recent RX at send time instead -- which, after a retransmit
+    delay on a busy node, may be a different packet's arrival, and for locally
+    originated traffic is whichever radio last heard anything. That is the
+    behaviour these modes have always had; it is kept unchanged rather than
+    approximated, and the duty-cycle gate compensates by holding every radio the
+    fabric could pick to its own budget.
     """
     mode_l = (mode or "default").strip().lower()
     if mode_l in ("", "default"):
         fabric.set_tx_selector(None)
         return
 
-    if mode_l == "sticky":
+    by_ingress = fabric_selects_by_ingress_radio(fabric)
+    if by_ingress:
+        logger.info("fabric.tx_mode=%s routes by each packet's ingress radio", mode_l)
+    else:
+        logger.warning(
+            "fabric.tx_mode=%s routes by the node's most recent RX: this openhop-core "
+            "does not pass a packet's ingress radio to the TX policy. Behaviour is "
+            "unchanged from before, and the duty-cycle gate holds every radio the node "
+            "could pick to its own budget rather than guessing which one will transmit.",
+            mode_l,
+        )
 
-        def _sticky(_data: bytes):
-            rid = getattr(fabric, "_last_rx_radio_id", None)
-            if rid and rid in fabric.radios:
-                return rid
-            return fabric.default_radio_id
+    if mode_l == "sticky":
+        if by_ingress:
+
+            def _sticky(_data: bytes, rx_radio_id):
+                if rx_radio_id and rx_radio_id in fabric.radios:
+                    return rx_radio_id
+                return fabric.default_radio_id
+
+        else:
+
+            def _sticky(_data: bytes):
+                rid = getattr(fabric, "_last_rx_radio_id", None)
+                if rid and rid in fabric.radios:
+                    return rid
+                return fabric.default_radio_id
 
         fabric.set_tx_selector(_sticky)
         return
 
     if mode_l == "bridge":
+        if by_ingress:
 
-        def _bridge(_data: bytes):
-            ids = list(fabric.radios.keys())
-            if len(ids) < 2:
+            def _bridge(_data: bytes, rx_radio_id):
+                ids = list(fabric.radios.keys())
+                if len(ids) < 2:
+                    return fabric.default_radio_id
+                if rx_radio_id and rx_radio_id in fabric.radios:
+                    for rid in ids:
+                        if rid != rx_radio_id:
+                            return rid
                 return fabric.default_radio_id
-            last = getattr(fabric, "_last_rx_radio_id", None)
-            if last and last in fabric.radios:
-                for rid in ids:
-                    if rid != last:
-                        return rid
-            return fabric.default_radio_id
+
+        else:
+
+            def _bridge(_data: bytes):
+                ids = list(fabric.radios.keys())
+                if len(ids) < 2:
+                    return fabric.default_radio_id
+                last = getattr(fabric, "_last_rx_radio_id", None)
+                if last and last in fabric.radios:
+                    for rid in ids:
+                        if rid != last:
+                            return rid
+                return fabric.default_radio_id
 
         fabric.set_tx_selector(_bridge)
         return
@@ -1042,6 +1122,98 @@ def build_radio_profiles(config: dict) -> list:
     rid = str(default_radio) if (default_radio and fabric_cfg.get("use_fabric")) else "radio0"
     profile = _radio_air_profile(normalized, rid)
     return [profile] if profile is not None else []
+
+
+def _inherited_air_profile(board_config: dict, radio_id: str) -> dict:
+    """A profile read straight from a board config's ``radio`` block.
+
+    The stand-in for a radio the profiler will not describe -- a disabled one,
+    or a radio_type it does not recognise. ``_merge_radio_entry`` has already
+    laid that entry's own ``radio:`` block over the top-level one, so a disabled
+    radio that still states its frequency and bandwidth is metered on them, and
+    one that states nothing inherits the settings the node would have used
+    anyway. Either way it lands in the same channel budget as any radio that
+    names that channel explicitly, rather than in a budget of its own.
+    """
+    radio_cfg = board_config.get("radio")
+    if not isinstance(radio_cfg, dict):
+        radio_cfg = {}
+
+    def _num(name: str) -> Optional[int]:
+        value = radio_cfg.get(name, _RADIO_AIR_COMMON_DEFAULTS.get(name))
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "radio_id": str(radio_id),
+        "radio_type": None,
+        "frequency_hz": _num("frequency"),
+        "bandwidth_hz": _num("bandwidth"),
+        "spreading_factor": _num("spreading_factor"),
+        "coding_rate": _num("coding_rate"),
+        "preamble_length": _num("preamble_length"),
+    }
+
+
+def build_metering_profiles(config: dict) -> list:
+    """Air settings for duty-cycle metering: one entry per configured radio.
+
+    ``build_radio_profiles`` is all-or-nothing on purpose. It feeds the UI,
+    where a partial list would draw a smaller Fabric than the node has and a
+    one-element list would claim every packet belonged to that radio.
+
+    Metering cannot accept that answer. A node whose second radio is
+    ``radio_type: none`` still boots a two-radio fabric -- ``get_radio_for_board``
+    hands back a NullRadio -- so reporting nothing collapses every channel onto
+    the top-level ``radio`` block, and the surviving radio is metered on a
+    modulation and a limit that are not its own. On the 62.5 kHz side of a live
+    bridge that charges 26.7 ms where the truth is 213.5, against 3600 where its
+    own entry says 600.
+
+    So each entry degrades on its own: a radio that cannot be profiled is
+    metered against the top-level block under its own id, and every radio that
+    can be profiled keeps its own modulation and its own band's limit.
+    """
+    if not isinstance(config, dict):
+        return []
+
+    try:
+        normalized = normalize_modem_config(config, warn=False)
+    except Exception:  # pragma: no cover - normalisation is defensive here
+        normalized = config
+
+    radios_cfg = normalized.get("radios")
+    if not isinstance(radios_cfg, list) or len(radios_cfg) == 0:
+        # No radios[] block: one radio, and build_radio_profiles already names
+        # it the way build_radio_stack does.
+        return build_radio_profiles(config)
+
+    profiles = []
+    for index, entry in enumerate(radios_cfg):
+        radio_id = None
+        profile = None
+        merged = None
+        try:
+            merged = _merge_radio_entry(normalized, entry)
+            radio_id = merged["_radio_id"]
+            profile = _radio_air_profile(merged, radio_id)
+        except ValueError as exc:
+            logger.warning("Cannot profile radios[] entry %d for metering: %s", index, exc)
+        if profile is None:
+            if radio_id is None:
+                raw_id = (
+                    entry.get("id") or entry.get("radio_id") if isinstance(entry, dict) else None
+                )
+                radio_id = str(raw_id or f"radio{index}")
+            logger.info(
+                "Radio %s has no air profile; metering it on the air settings it inherits",
+                radio_id,
+            )
+            profile = _inherited_air_profile(merged or normalized, radio_id)
+        profiles.append(profile)
+    return profiles
 
 
 def build_radio_stack(config: dict):

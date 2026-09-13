@@ -8,8 +8,10 @@ import pytest
 
 from repeater.config import (
     NullRadio,
+    _apply_fabric_tx_mode,
     _merge_radio_entry,
     build_radio_stack,
+    fabric_selects_by_ingress_radio,
 )
 
 
@@ -125,7 +127,7 @@ def test_build_radio_stack_multi_wraps_fabric():
 
 
 @pytest.mark.asyncio
-async def test_sticky_tx_uses_last_rx_radio():
+async def test_sticky_tx_uses_the_packets_own_ingress_radio():
     a = _FakeRadio("a")
     b = _FakeRadio("b")
 
@@ -143,11 +145,23 @@ async def test_sticky_tx_uses_last_rx_radio():
     with patch("repeater.config.get_radio_for_board", side_effect=fake_get):
         radio, meta = build_radio_stack(cfg)
 
-    # Simulate RX on link
+    # A packet heard on link replies on link.
     b.rx_callback(b"hello", -70, 3.0)
-    await radio.send(b"reply")
+    await radio.send(b"reply", rx_radio_id="link")
     assert b.sent == [b"reply"]
     assert a.sent == []
+
+    # Nothing this node originated arrived anywhere, so it leaves by the default
+    # radio. It used to leave by whichever radio last heard anything, which is
+    # not a property of the packet being sent.
+    await radio.send(b"advert")
+    assert a.sent == [b"advert"]
+    assert b.sent == [b"reply"]
+
+    # And another node's traffic arriving in between does not move it.
+    a.rx_callback(b"noise", -70, 3.0)
+    await radio.send(b"reply-2", rx_radio_id="link")
+    assert b.sent == [b"reply", b"reply-2"]
 
 
 def test_use_fabric_single_radio():
@@ -204,14 +218,20 @@ async def test_bridge_tx_crosses_to_other_radio():
 
     # Heard on local neighborhood -> forward out link backhaul
     a.rx_callback(b"from-local", -70, 3.0)
-    await radio.send(b"fwd-1")
+    await radio.send(b"fwd-1", rx_radio_id="local")
     assert a.sent == []
     assert b.sent == [b"fwd-1"]
 
     # Heard on link backhaul -> forward out local
     b.rx_callback(b"from-link", -80, 2.0)
-    await radio.send(b"fwd-2")
+    await radio.send(b"fwd-2", rx_radio_id="link")
     assert a.sent == [b"fwd-2"]
+    assert b.sent == [b"fwd-1"]
+
+    # A locally originated packet has no side of the bridge to come from, so it
+    # goes out on the default radio rather than on whatever the node last heard.
+    await radio.send(b"advert")
+    assert a.sent == [b"fwd-2", b"advert"]
     assert b.sent == [b"fwd-1"]
 
 
@@ -354,3 +374,66 @@ def test_merge_radio_entry_preserves_per_radio_ch341():
     merged = _merge_radio_entry(global_cfg, entry)
     assert merged["ch341"]["address"] == 8
     assert merged["_ch341_per_instance"] is True
+
+
+class _LegacyFabric:
+    """A fabric from an openhop-core that predates the ingress-radio argument.
+
+    The only difference that matters is the signature of resolve_tx_radio_id,
+    which is how the repeater tells the two apart.
+    """
+
+    def __init__(self):
+        self.radios = {"local": object(), "link": object()}
+        self.default_radio_id = "local"
+        self._last_rx_radio_id = None
+        self.selector = None
+
+    def resolve_tx_radio_id(self, data, radio_id=None):
+        return radio_id
+
+    def set_tx_selector(self, selector):
+        self.selector = selector
+
+
+def test_an_older_core_is_given_the_one_argument_selector_it_can_call():
+    """The fallback has to be callable by the core that gets it, or the node
+    raises TypeError on its first transmission."""
+    fabric = _LegacyFabric()
+    assert fabric_selects_by_ingress_radio(fabric) is False
+
+    _apply_fabric_tx_mode(fabric, "sticky")
+    fabric._last_rx_radio_id = "link"
+
+    assert fabric.selector(b"frame") == "link"
+    with pytest.raises(TypeError):
+        fabric.selector(b"frame", "local")
+
+
+def test_an_older_core_keeps_the_behaviour_it_always_had():
+    """It reads the node's most recent RX, including for locally originated
+    traffic. Unchanged, deliberately: approximating it would move packets on the
+    air on nodes that did not update their core."""
+    fabric = _LegacyFabric()
+    _apply_fabric_tx_mode(fabric, "bridge")
+
+    fabric._last_rx_radio_id = "local"
+    assert fabric.selector(b"frame") == "link"
+    fabric._last_rx_radio_id = None
+    assert fabric.selector(b"frame") == "local"
+
+
+def test_a_current_core_is_given_the_selector_that_routes_by_ingress_radio():
+    from openhop_core.rf_fabric import RFFabric
+
+    fabric = RFFabric()
+    fabric.register_radio(object(), radio_id="local")
+    fabric.register_radio(object(), radio_id="link")
+    assert fabric_selects_by_ingress_radio(fabric) is True
+
+    _apply_fabric_tx_mode(fabric, "bridge")
+
+    assert fabric.resolve_tx_radio_id(b"frame", rx_radio_id="local") == "link"
+    assert fabric.resolve_tx_radio_id(b"frame", rx_radio_id="link") == "local"
+    # Originated here, so there is no side of the bridge to come from.
+    assert fabric.resolve_tx_radio_id(b"frame") == "local"
