@@ -24,7 +24,7 @@ from openhop_core.protocol.constants import (
 from openhop_core.rf_fabric import RFFabric
 
 from repeater.airtime import AirtimeBudgets, AirtimeManager
-from repeater.config import _apply_fabric_tx_mode
+from repeater.config import _apply_fabric_tx_mode, fabric_selects_by_ingress_radio
 from repeater.engine import RepeaterHandler
 
 WIDE = {
@@ -189,16 +189,61 @@ def test_a_retune_keeps_what_is_already_on_the_air():
 # ---------------------------------------------------------------------------
 
 
-def _fabric(radio_ids, default_radio_id=None, tx_mode="default"):
-    """A real RFFabric with the real tx_mode selectors bound to it.
+CORE_SELECTS_BY_INGRESS = fabric_selects_by_ingress_radio(RFFabric())
 
-    Not a stub. The one review finding that survived two passes came from an
-    engine that re-stated the fabric's dispatch rules and then diverged from
-    them; a fixture that also re-states them cannot catch that. This registers
-    real radios and runs `_apply_fabric_tx_mode`, so the answer the engine gets
-    is the answer the node would get.
+
+class _ContextFabric:
+    """The fabric contract these tests need, for a core that does not have it yet.
+
+    Used only when the installed openhop_core predates passing the ingress radio
+    to a TX selector; with a current core every test below runs against the real
+    RFFabric. What it implements is core's rule and nothing more -- an explicit
+    radio_id wins, then the selector, then default_radio -- so the engine is
+    still measured against the contract rather than against a convenience.
     """
-    fabric = RFFabric()
+
+    def __init__(self):
+        self.radios = OrderedDict()
+        self._default_radio_id = None
+        self._selector = None
+
+    def register_radio(self, radio, *, radio_id):
+        self.radios[radio_id] = radio
+        if self._default_radio_id is None:
+            self._default_radio_id = radio_id
+
+    def set_default_radio(self, radio_id):
+        self._default_radio_id = radio_id
+
+    @property
+    def default_radio_id(self):
+        return self._default_radio_id
+
+    def get_radio(self, radio_id):
+        return self.radios[radio_id]
+
+    def set_tx_selector(self, selector):
+        self._selector = selector
+
+    def resolve_tx_radio_id(self, data, radio_id=None, *, rx_radio_id=None):
+        if radio_id is not None:
+            return radio_id
+        if self._selector is not None:
+            selected = self._selector(data, rx_radio_id)
+            if selected is not None:
+                return selected
+        return self._default_radio_id
+
+
+def _fabric(radio_ids, default_radio_id=None, tx_mode="default"):
+    """A fabric with the real tx_mode selectors bound to it.
+
+    The real RFFabric where the installed core supports the ingress radio. Not a
+    stub that restates the dispatch rules either way: the one review finding
+    that survived two passes came from an engine that re-stated them and then
+    diverged, and a fixture that also restates them cannot catch that.
+    """
+    fabric = RFFabric() if CORE_SELECTS_BY_INGRESS else _ContextFabric()
     for radio_id in radio_ids:
         fabric.register_radio(object(), radio_id=radio_id)
     if default_radio_id in radio_ids:

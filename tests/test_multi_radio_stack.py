@@ -15,6 +15,18 @@ from repeater.config import (
 )
 
 
+def _core_selects_by_ingress() -> bool:
+    from openhop_core.rf_fabric import RFFabric
+
+    return fabric_selects_by_ingress_radio(RFFabric())
+
+
+needs_ingress_core = pytest.mark.skipif(
+    not _core_selects_by_ingress(),
+    reason="installed openhop_core does not pass a packet's ingress radio to the TX selector",
+)
+
+
 class _FakeRadio:
     def __init__(self, name="r"):
         self.name = name
@@ -126,6 +138,7 @@ def test_build_radio_stack_multi_wraps_fabric():
     assert radio.fabric._tx_selector is not None
 
 
+@needs_ingress_core
 @pytest.mark.asyncio
 async def test_sticky_tx_uses_the_packets_own_ingress_radio():
     a = _FakeRadio("a")
@@ -194,6 +207,7 @@ def test_tx_mode_all_rejected():
             build_radio_stack(cfg)
 
 
+@needs_ingress_core
 @pytest.mark.asyncio
 async def test_bridge_tx_crosses_to_other_radio():
     """RX on local -> TX on link; RX on link -> TX on local."""
@@ -423,6 +437,7 @@ def test_an_older_core_keeps_the_behaviour_it_always_had():
     assert fabric.selector(b"frame") == "local"
 
 
+@needs_ingress_core
 def test_a_current_core_is_given_the_selector_that_routes_by_ingress_radio():
     from openhop_core.rf_fabric import RFFabric
 

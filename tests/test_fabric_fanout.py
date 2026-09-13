@@ -550,9 +550,11 @@ async def test_local_origin_default_mode_keeps_single_fabric_send():
     rig = _Rig({"repeat_on_ingress": True})  # origin_tx defaults to "default"
     assert await rig.handler(_flood(), {}, local_transmission=True) is True
     assert rig.air.order == ["local"]
-    # Same radio on the air as when the fabric chose at send time; the engine now
-    # names it instead, so the duty cycle can be charged to the right channel.
-    assert rig.sent_radio_ids == ["local"]
+    # Same radio on the air either way. With a core that passes the ingress radio
+    # to the TX policy the engine names it, so the duty cycle can be charged to
+    # the right channel; without one it leaves the choice to the fabric, as it
+    # always did. What must not change is which radio transmits.
+    assert rig.sent_radio_ids in (["local"], [None])
     assert rig.records()[-1]["tx_radio_ids"] == ["local"]
 
 
