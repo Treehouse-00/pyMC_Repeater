@@ -227,6 +227,16 @@ class _RadioAirtimeBudget:
             return self._calculator.preamble_length
 
 
+def _window_ms(ledger: AirtimeManager) -> float:
+    """Airtime still inside the rolling window, without mutating the ledger."""
+    cutoff = time.time() - ledger.window_size
+    return sum(at for ts, at in ledger.tx_history if ts > cutoff)
+
+
+def _snapshot(ledger: AirtimeManager) -> Tuple[list, float, float]:
+    return (list(ledger.tx_history), ledger.total_airtime_ms, ledger.total_rx_airtime_ms)
+
+
 @dataclass
 class _BudgetState:
     by_radio: dict
@@ -261,6 +271,23 @@ class AirtimeBudgets:
     def __init__(self, config: dict):
         self.config = config
         self._lock = threading.RLock()
+        # One ledger per channel, kept for as long as that channel matters --
+        # across rebuilds, and after the last radio leaves it. A duty cycle is a
+        # property of the spectrum, not of whichever radio happens to be tuned
+        # there, so the ledger has to outlive the radio's assignment to it.
+        self._ledgers: dict = {}
+        # Lifetime totals of channels dropped once their window emptied, so the
+        # node total still counts airtime the node really did transmit.
+        self._retired_tx = 0.0
+        self._retired_rx = 0.0
+        # The air settings each radio is actually being metered with, which is
+        # not always what the config says: a non-default radio's modulation only
+        # reaches the hardware on a restart.
+        self._metered_air: dict = {}
+        # None means "adopt whatever the config says", which is what a fresh
+        # build does. refresh() narrows it to the radios that were really
+        # retuned.
+        self._adopt_air: Optional[set] = None
         self._state = self._build_state()
 
     # ------------------------------------------------------------------
@@ -277,7 +304,13 @@ class AirtimeBudgets:
             profiles = []
 
         if not profiles:
-            ledger = AirtimeManager(self.config)
+            duty_cycle = self.config.get("duty_cycle", {}) or {}
+            ledger = self._ledger_for(
+                None,
+                self.config.get("radio", {}) or {},
+                duty_cycle.get("max_airtime_per_minute", 3600),
+            )
+            self._prune_retired({None})
             view = _RadioAirtimeBudget(ledger, ledger, self._lock)
             return _BudgetState(
                 by_radio={None: view},
@@ -292,12 +325,18 @@ class AirtimeBudgets:
         shared = bool(self.config.get("duty_cycle", {}).get("shared_budget", False))
         order = []
         channel_of = {}
+        effective = {}
         for profile in profiles:
             radio_id = str(profile["radio_id"])
             order.append(radio_id)
+            air = self._effective_air(profile)
+            effective[radio_id] = air
+            # Keyed on what this radio is really transmitting with, so a pending
+            # retune does not move it onto a channel it is not on yet.
             channel_of[radio_id] = (
-                "shared" if shared else (profile.get("frequency_hz"), profile.get("bandwidth_hz"))
+                "shared" if shared else (air.get("frequency"), air.get("bandwidth"))
             )
+        self._metered_air = effective
 
         by_channel = {}
         by_radio = {}
@@ -306,21 +345,22 @@ class AirtimeBudgets:
             key = channel_of[radio_id]
             ledger = by_channel.get(key)
             if ledger is None:
-                ledger = AirtimeManager(
-                    self.config,
-                    radio_config=self._air_settings(profile),
-                    max_airtime_per_minute=self._channel_budget(
+                ledger = self._ledger_for(
+                    key,
+                    effective[radio_id],
+                    self._channel_budget(
                         [rid for rid, rid_key in channel_of.items() if rid_key == key]
                     ),
                 )
                 by_channel[key] = ledger
             calculator = AirtimeManager(
                 self.config,
-                radio_config=self._air_settings(profile),
+                radio_config=effective[radio_id],
                 max_airtime_per_minute=ledger.max_airtime_per_minute,
             )
             by_radio[radio_id] = _RadioAirtimeBudget(ledger, calculator, self._lock)
 
+        self._prune_retired(set(by_channel))
         default_radio_id = self._default_radio_id(by_radio, order)
         return _BudgetState(
             by_radio=by_radio,
@@ -332,6 +372,97 @@ class AirtimeBudgets:
             default=by_radio[default_radio_id],
         )
 
+    def _ledger_for(
+        self,
+        key,
+        radio_config: Optional[dict],
+        max_airtime_per_minute: Optional[float],
+    ) -> AirtimeManager:
+        """The ledger for one channel, kept across rebuilds.
+
+        A channel's spend belongs to the spectrum, so the ledger persists and is
+        simply re-tuned when a radio on it changes modulation or limit. Nothing
+        is copied between channels: copying is what let a split hand the same
+        history to both sides and a later merge add the copies together, so a
+        node could double its recorded spend by retuning a radio back and forth.
+        """
+        ledger = self._ledgers.get(key)
+        if ledger is not None:
+            if radio_config is not None:
+                ledger.refresh_radio_params(radio_config)
+            if max_airtime_per_minute is not None:
+                ledger.max_airtime_per_minute = max_airtime_per_minute
+            return ledger
+
+        ledger = AirtimeManager(
+            self.config,
+            radio_config=radio_config,
+            max_airtime_per_minute=max_airtime_per_minute,
+        )
+        seed = self._seed_for(key)
+        if seed is not None:
+            ledger.tx_history = list(seed[0])
+            ledger.total_airtime_ms = seed[1]
+            ledger.total_rx_airtime_ms = seed[2]
+        self._ledgers[key] = ledger
+        return ledger
+
+    def _seed_for(self, key):
+        """What a channel with no ledger of its own should start from.
+
+        A frequency this node has not transmitted on starts empty, because it
+        has not: duty cycle is per channel, and a radio arriving from a busy
+        band brings none of that band's spend with it.
+
+        The exception is a channel nobody can name. ``None`` is the key used
+        when the radio profiles cannot be read, and it stands for "some channel,
+        we cannot say which" -- so it inherits the busiest window the node is
+        keeping, and a named channel inherits from it in turn. Starting either
+        at zero mid-window would hand the node a second full allowance.
+        """
+        if key is None:
+            return self._busiest_snapshot(exclude=None)
+        unidentified = self._ledgers.get(None)
+        if unidentified is not None and _window_ms(unidentified) > 0:
+            return _snapshot(unidentified)
+        return None
+
+    def _busiest_snapshot(self, exclude=None):
+        """The retained channel with the most airtime still inside the window."""
+        candidates = [ledger for channel, ledger in self._ledgers.items() if channel is not exclude]
+        if not candidates:
+            return None
+        return _snapshot(max(candidates, key=_window_ms))
+
+    def _prune_retired(self, present_keys: set) -> None:
+        """Drop channels nobody is on once their window has emptied.
+
+        Their lifetime totals move to the node's running totals rather than
+        vanishing -- the node did transmit that airtime -- but the ledger itself
+        goes, so a node whose radios are retuned repeatedly does not accumulate
+        one per frequency ever configured.
+        """
+        for key in list(self._ledgers):
+            if key in present_keys:
+                continue
+            ledger = self._ledgers[key]
+            if _window_ms(ledger) > 0:
+                continue
+            self._retired_tx += ledger.total_airtime_ms
+            self._retired_rx += ledger.total_rx_airtime_ms
+            del self._ledgers[key]
+
+    def _absent_totals(self, present) -> Tuple[float, float]:
+        """Lifetime totals of channels still retained but with no radio on them."""
+        total_tx = self._retired_tx
+        total_rx = self._retired_rx
+        for key, ledger in self._ledgers.items():
+            if key in present:
+                continue
+            total_tx += ledger.total_airtime_ms
+            total_rx += ledger.total_rx_airtime_ms
+        return total_tx, total_rx
+
     def _air_settings(self, profile: dict) -> dict:
         """A profile in the shape AirtimeManager reads air settings from.
 
@@ -341,6 +472,7 @@ class AirtimeBudgets:
         """
         settings = dict(self.config.get("radio", {}) or {})
         for key, value in (
+            ("frequency", profile.get("frequency_hz")),
             ("spreading_factor", profile.get("spreading_factor")),
             ("bandwidth", profile.get("bandwidth_hz")),
             ("coding_rate", profile.get("coding_rate")),
@@ -348,6 +480,28 @@ class AirtimeBudgets:
         ):
             if value is not None:
                 settings[key] = value
+        return settings
+
+    def _effective_air(self, profile: dict) -> dict:
+        """The air settings this radio is metering with, which may not be the
+        configured ones.
+
+        Only the default radio can be retuned without a restart. A change to any
+        other radio sits in ``radios[]`` marked restart-required, and the
+        hardware goes on transmitting with what it has -- so adopting the new
+        modulation would meter a 62.5 kHz radio at 500 kHz until someone
+        restarted the service. That is exactly what an unrelated duty-cycle save
+        used to do, because it rebuilds from the same config.
+
+        The limit is a different matter and is always adopted: it is policy, not
+        hardware, and takes effect the moment it is saved.
+        """
+        settings = self._air_settings(profile)
+        radio_id = str(profile["radio_id"])
+        if self._adopt_air is not None and radio_id not in self._adopt_air:
+            previous = self._metered_air.get(radio_id)
+            if previous is not None:
+                return dict(previous)
         return settings
 
     def _channel_budget(self, radio_ids: list) -> Optional[float]:
@@ -392,64 +546,34 @@ class AirtimeBudgets:
     # Rebuilding on a live config change
     # ------------------------------------------------------------------
 
-    def refresh(self) -> None:
+    def refresh(self, adopt_air_for: Optional[set] = None) -> None:
         """Rebuild the budgets from the current config, keeping what was spent.
 
         A live radio change moves a channel, and the new modulation has to meter
-        the next send. What is already on the air is carried over: a retune is
-        not a fresh minute, and forgetting it would let a node transmit its whole
-        budget twice in one window.
+        the next send. What is already on the air stays where it was spent: a
+        retune is not a fresh minute.
 
-        Carried between *channels* rather than between radios, because a channel
-        is what a duty cycle applies to, and because it makes a rebuild
-        idempotent: refreshing an unchanged config hands every channel back its
-        own history exactly, however many times it is called. Two channels
-        merging into one sum, because that channel really did carry both. One
-        channel splitting hands each side the full history, since neither can
-        prove it was the quiet one; a second refresh then finds each side's own
-        key and stops there rather than doubling again.
+        ``adopt_air_for`` names the radios whose modulation really reached the
+        hardware; every other radio goes on being metered with what it is
+        transmitting now. Omitted, every radio's configured settings are
+        adopted, which is right at boot and wrong after a live save.
+
+        Nothing is carried between channels, because each channel keeps its own
+        ledger and a rebuild only re-tunes it. That is what makes this safe to
+        call repeatedly. Carrying copies between channels is what let a split
+        hand the same history to both sides and a later merge add those copies
+        together -- six clicks in the web UI turned 500 ms of real airtime into
+        4000 ms and stopped the node forwarding -- while a channel whose last
+        radio left lost its ledger entirely, so a radio retuning onto it started
+        from zero on spectrum that had just carried 3000 ms.
         """
         with self._lock:
             previous = self._state
-            snapshots = {
-                key: (
-                    list(manager.tx_history),
-                    manager.total_airtime_ms,
-                    manager.total_rx_airtime_ms,
-                )
-                for key, manager in previous.by_channel.items()
-            }
-            rebuilt = self._build_state()
-
-            for key, manager in rebuilt.by_channel.items():
-                sources = {
-                    previous.channel_of[radio_id]
-                    for radio_id, radio_key in rebuilt.channel_of.items()
-                    if radio_key == key and radio_id in previous.channel_of
-                }
-                if not sources:
-                    busiest = max(
-                        snapshots.values(),
-                        key=lambda carried: sum(at for _, at in carried[0]),
-                        default=None,
-                    )
-                    if busiest is None:
-                        continue
-                    carried_all = [busiest]
-                else:
-                    carried_all = [snapshots[source] for source in sources]
-
-                history: list = []
-                total_tx = 0.0
-                total_rx = 0.0
-                for carried in carried_all:
-                    history.extend(carried[0])
-                    total_tx += carried[1]
-                    total_rx += carried[2]
-                manager.tx_history = sorted(history, key=lambda entry: entry[0])
-                manager.total_airtime_ms = total_tx
-                manager.total_rx_airtime_ms = total_rx
-
+            self._adopt_air = None if adopt_air_for is None else set(adopt_air_for)
+            try:
+                rebuilt = self._build_state()
+            finally:
+                self._adopt_air = None
             self._reuse_views(previous, rebuilt)
             self._state = rebuilt
 
@@ -494,6 +618,12 @@ class AirtimeBudgets:
         """The manager everything that reports one channel's figures reads."""
         with self._lock:
             return self._state.default
+
+    @property
+    def default_radio_id(self) -> Optional[str]:
+        """The radio the fabric transmits on by default, as metering sees it."""
+        with self._lock:
+            return self._state.default_radio_id
 
     @property
     def multi(self) -> bool:
@@ -575,15 +705,22 @@ class AirtimeBudgets:
         On a single-radio node every figure is that one manager's, unchanged.
         """
         with self._lock:
-            managers = list(self._state.by_channel.values())
-            if len(managers) == 1:
+            present = self._state.by_channel
+            managers = list(present.values())
+            # Airtime the node transmitted on channels no radio sits on any
+            # more. A retune does not un-transmit it, and these are lifetime
+            # counters, so it still belongs in the node's total.
+            absent_tx, absent_rx = self._absent_totals(set(present))
+            if len(managers) == 1 and not absent_tx and not absent_rx:
                 return managers[0].get_stats()
 
             stats = [manager.get_stats() for manager in managers]
             return {
+                # The window and the limit describe the channels the node is on
+                # now; a channel it has left cannot be transmitted on.
                 "current_airtime_ms": sum(s["current_airtime_ms"] for s in stats),
                 "max_airtime_ms": sum(s["max_airtime_ms"] for s in stats),
                 "utilization_percent": max(s["utilization_percent"] for s in stats),
-                "total_airtime_ms": sum(s["total_airtime_ms"] for s in stats),
-                "total_rx_airtime_ms": sum(s["total_rx_airtime_ms"] for s in stats),
+                "total_airtime_ms": sum(s["total_airtime_ms"] for s in stats) + absent_tx,
+                "total_rx_airtime_ms": sum(s["total_rx_airtime_ms"] for s in stats) + absent_rx,
             }

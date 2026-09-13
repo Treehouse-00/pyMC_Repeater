@@ -639,12 +639,35 @@ def test_tx_mode_default_is_exact_even_on_an_older_core():
     assert handler._egress_candidates() == ("link",)
 
 
-def test_an_unplanned_send_needs_every_candidate_to_have_budget():
+def test_an_unplanned_send_is_gated_on_the_radio_the_fabric_names():
+    """An older core will say which radio it is about to use; that one has to
+    have the budget, and the others are beside the point."""
+    config = _config(BRIDGE)
+    config["fabric"] = {"default_radio": "local", "tx_mode": "sticky"}
+    handler = _make_handler(config, legacy_core=True)
+    handler.dispatcher.radio.fabric._last_rx_radio_id = "link"
+    handler.airtime_budgets.for_radio("link").record_tx(3600)
+
+    can_tx, wait = handler._egress_can_transmit(_packet(), None)
+    assert can_tx is False
+    assert wait > 0
+
+    # The exhausted radio is no longer the one it would pick.
+    handler.dispatcher.radio.fabric._last_rx_radio_id = "local"
+    assert handler._egress_can_transmit(_packet(), None)[0] is True
+
+
+def test_a_fabric_that_will_not_answer_falls_back_to_every_candidate():
     """Gating on *any* candidate is how a node transmits past a legal limit: it
     only has to guess the quiet channel."""
     config = _config(BRIDGE)
     config["fabric"] = {"default_radio": "local", "tx_mode": "bridge"}
     handler = _make_handler(config, legacy_core=True)
+
+    def _refuse(*args, **kwargs):
+        raise RuntimeError("no answer")
+
+    handler.dispatcher.radio.fabric.resolve_tx_radio_id = _refuse
     handler.airtime_budgets.for_radio("link").record_tx(3600)
 
     can_tx, wait = handler._egress_can_transmit(_packet(), None)
@@ -654,16 +677,35 @@ def test_an_unplanned_send_needs_every_candidate_to_have_budget():
 
 
 @pytest.mark.asyncio
-async def test_an_unplanned_send_is_refused_at_tx_time_by_any_exhausted_radio():
+async def test_an_unplanned_send_is_refused_when_its_own_radio_is_exhausted():
     config = _config(BRIDGE)
-    config["fabric"] = {"default_radio": "local", "tx_mode": "bridge"}
+    config["fabric"] = {"default_radio": "local", "tx_mode": "sticky"}
     handler = _make_handler(config, legacy_core=True)
+    handler.dispatcher.radio.fabric._last_rx_radio_id = "link"
     handler.airtime_budgets.for_radio("link").record_tx(3600)
 
     task = await handler.schedule_retransmit(_packet(), delay=0.0, airtime_ms=10.0)
 
     assert await task is False
     assert handler.dispatcher.send_packet.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_an_older_core_still_sends_on_the_radio_it_would_have_chosen():
+    """Reported by review: holding every candidate to its budget refused a send
+    the fabric was about to put on an idle radio, black-holing that band for the
+    rest of the window."""
+    config = _config(BRIDGE)
+    config["fabric"] = {"default_radio": "local", "tx_mode": "sticky"}
+    handler = _make_handler(config, legacy_core=True)
+    handler.dispatcher.radio.fabric._last_rx_radio_id = "link"
+    handler.airtime_budgets.for_radio("local").record_tx(3600)  # the other radio
+
+    task = await handler.schedule_retransmit(_packet(), delay=0.0, airtime_ms=10.0)
+
+    assert await task is True
+    assert handler.dispatcher.send_packet.await_count == 1
+    assert handler.airtime_budgets.for_radio("link").get_stats()["current_airtime_ms"] > 0
 
 
 @pytest.mark.asyncio
@@ -738,8 +780,10 @@ def test_a_plain_single_radio_node_is_untouched_by_that():
     assert budgets.default.max_airtime_per_minute == legacy.max_airtime_per_minute
 
 
-def test_radios_merging_onto_one_channel_sum_what_they_spent():
-    """The channel really did carry both, so the new budget owes both."""
+def test_radios_merging_onto_one_channel_owe_that_channels_spend():
+    """A channel owes what was transmitted on it, not what the arriving radio
+    spent somewhere else. link's 1800 ms was on 910.525 MHz; retuning link to
+    910.100 does not move that airtime onto 910.100."""
     config = _config(BRIDGE)
     budgets = AirtimeBudgets(config)
     budgets.for_radio("local").record_tx(1800)
@@ -749,12 +793,15 @@ def test_radios_merging_onto_one_channel_sum_what_they_spent():
     budgets.refresh()
 
     assert budgets.shares_budget("local", "link")
-    assert budgets.for_radio("local").get_stats()["current_airtime_ms"] == 3600
-    assert budgets.for_radio("local").can_transmit(10)[0] is False
+    assert budgets.for_radio("local").get_stats()["current_airtime_ms"] == 1800
+    # Both radios now sit on a channel with half its allowance left.
+    assert budgets.for_radio("link").can_transmit(1700)[0] is True
+    assert budgets.for_radio("link").can_transmit(1900)[0] is False
 
 
-def test_a_channel_splitting_leaves_the_spend_on_both_sides():
-    """Neither side can prove it was the quiet one."""
+def test_a_radio_retuning_to_fresh_spectrum_takes_no_spend_with_it():
+    """The spend stays on the channel that carried it. south moves to spectrum
+    this node has not transmitted on, and that spectrum is genuinely idle."""
     config = _config([_radio("north", WIDE), _radio("south", WIDE)])
     budgets = AirtimeBudgets(config)
     budgets.for_radio("north").record_tx(3600)
@@ -763,7 +810,47 @@ def test_a_channel_splitting_leaves_the_spend_on_both_sides():
     budgets.refresh()
 
     assert budgets.for_radio("north").get_stats()["current_airtime_ms"] == 3600
-    assert budgets.for_radio("south").get_stats()["current_airtime_ms"] == 3600
+    assert budgets.for_radio("north").can_transmit(10)[0] is False
+    assert budgets.for_radio("south").get_stats()["current_airtime_ms"] == 0
+    assert budgets.for_radio("south").can_transmit(10)[0] is True
+
+
+def test_a_channel_keeps_its_spend_after_its_last_radio_leaves():
+    """Reported by review as the worst of these: a channel whose radios all move
+    away lost its ledger, so the next radio onto that spectrum started from
+    zero -- 3000 ms already on the air, then a fresh 3600 ms allowance inside
+    the same minute."""
+    config = _config([_radio("r1", WIDE), _radio("r2", NARROW)])
+    budgets = AirtimeBudgets(config)
+    budgets.for_radio("r1").record_tx(3000)
+
+    config["radios"][0]["radio"] = dict(WIDE, frequency=911000000)
+    budgets.refresh()
+    config["radios"][1]["radio"] = dict(WIDE)  # r2 arrives on the channel r1 left
+    budgets.refresh()
+
+    assert budgets.for_radio("r2").get_stats()["current_airtime_ms"] == 3000
+    assert budgets.for_radio("r2").can_transmit(3500)[0] is False
+    assert budgets.for_radio("r2").can_transmit(500)[0] is True
+
+
+def test_retuning_back_and_forth_does_not_inflate_what_was_spent():
+    """Reported by review: copying a channel's history to both sides of a split
+    and summing the copies on the next merge doubled the ledger per cycle. Six
+    applies in the web UI turned 500 ms into 4000 ms and stopped the node
+    forwarding for a minute."""
+    config = _config([_radio("local", WIDE), _radio("link", WIDE)])
+    budgets = AirtimeBudgets(config)
+    budgets.for_radio("local").record_tx(500)
+
+    for step in range(6):
+        config["radios"][0]["radio"] = (
+            dict(WIDE, frequency=910300000) if step % 2 == 0 else dict(WIDE)
+        )
+        budgets.refresh()
+
+    assert budgets.node_stats()["total_airtime_ms"] == 500
+    assert budgets.for_radio("link").get_stats()["current_airtime_ms"] == 500
 
 
 def test_losing_the_radio_list_does_not_hand_back_a_fresh_window():
@@ -931,7 +1018,7 @@ def test_readers_cannot_observe_a_partially_rebuilt_state(monkeypatch):
     assert read_finished.is_set()
 
 
-def test_a_new_radio_starts_from_the_busiest_channel_not_the_sum_of_them():
+def test_a_radio_added_on_fresh_spectrum_starts_empty():
     config = _config([_radio("local", WIDE), _radio("link", NARROW)])
     budgets = AirtimeBudgets(config)
     budgets.for_radio("local").record_tx(100)
@@ -940,7 +1027,10 @@ def test_a_new_radio_starts_from_the_busiest_channel_not_the_sum_of_them():
     config["radios"].append(_radio("third", dict(WIDE, frequency=915000000)))
     budgets.refresh()
 
-    assert budgets.for_radio("third").get_stats()["current_airtime_ms"] == 400
+    # 915 MHz has carried nothing, and no duty cycle says otherwise.
+    assert budgets.for_radio("third").get_stats()["current_airtime_ms"] == 0
+    assert budgets.for_radio("local").get_stats()["current_airtime_ms"] == 100
+    assert budgets.for_radio("link").get_stats()["current_airtime_ms"] == 400
 
 
 def test_changing_the_default_radio_keeps_the_manager_captured_at_boot():
@@ -1038,3 +1128,48 @@ async def test_an_older_core_still_forwards_and_still_meters():
     # Charged somewhere rather than nowhere -- the default budget, since the
     # send reported no radio of its own.
     assert handler.airtime_budgets.default.get_stats()["current_airtime_ms"] > 0
+
+
+def test_a_pending_restart_required_retune_does_not_become_live_metering():
+    """Reported by review: a non-default radio's new modulation sits in radios[]
+    until a restart, but the next unrelated duty-cycle save rebuilt the budgets
+    from that same config and started metering it -- 8x under the truth on the
+    narrow side, on hardware that had not been retuned."""
+    from repeater.config_manager import ConfigManager
+
+    config = _config(BRIDGE)
+    config["fabric"] = {"default_radio": "local", "tx_mode": "default"}
+    handler = _make_handler(config)
+    assert handler.airtime_budgets.for_radio("link").bandwidth == NARROW["bandwidth"]
+
+    daemon = MagicMock()
+    daemon.repeater_handler = handler
+    manager = ConfigManager("/dev/null", config, daemon)
+
+    # A non-default radio is edited. Restart required; hardware unchanged.
+    config["radios"][1]["radio"] = dict(WIDE)
+    # Any later save that rebuilds the budgets, e.g. a duty-cycle change.
+    manager._refresh_airtime_radio_params()
+
+    assert handler.airtime_budgets.for_radio("link").bandwidth == NARROW["bandwidth"]
+    # And the limit, which is policy rather than hardware, still follows config.
+    config["radios"][1]["duty_cycle"] = {"max_airtime_per_minute": 600}
+    manager._refresh_airtime_radio_params()
+    assert handler.airtime_budgets.for_radio("link").max_airtime_per_minute == 600
+    assert handler.airtime_budgets.for_radio("link").bandwidth == NARROW["bandwidth"]
+
+
+def test_the_default_radio_adopts_its_new_modulation_once_it_is_applied():
+    from repeater.config_manager import ConfigManager
+
+    config = _config(BRIDGE)
+    config["fabric"] = {"default_radio": "local", "tx_mode": "default"}
+    handler = _make_handler(config)
+    daemon = MagicMock()
+    daemon.repeater_handler = handler
+    manager = ConfigManager("/dev/null", config, daemon)
+
+    config["radios"][0]["radio"] = dict(NARROW)
+    manager._refresh_airtime_radio_params(default_radio_applied=True)
+
+    assert handler.airtime_budgets.for_radio("local").bandwidth == NARROW["bandwidth"]

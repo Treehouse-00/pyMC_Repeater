@@ -4907,7 +4907,14 @@ class APIEndpoints:
 
             # A Fabric edit targets the named radio, or its default when the old
             # single-radio request shape omits radio_id.
+            # A blank radio_id is the request not naming one, not a request to
+            # name the empty string. Left as-is it fell past the radios[] lookup
+            # without matching or erroring, wrote the top-level block alone, and
+            # left the default radio's own entry behind -- hardware on one
+            # bandwidth, its duty-cycle meter on another.
             target_radio_id = data.get("radio_id")
+            if isinstance(target_radio_id, str) and not target_radio_id.strip():
+                target_radio_id = None
             radios_list = self.config.get("radios")
             target_radio_cfg = self.config["radio"]
             target_entry = None

@@ -150,14 +150,23 @@ class ConfigManager:
                         return False
 
             self._sync_repeater_handler_radio_config(radio_cfg)
-            self._refresh_airtime_radio_params()
+            self._refresh_airtime_radio_params(default_radio_applied=True)
             logger.info("Applied live radio configuration to running daemon")
             return True
         except Exception as e:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
 
-    def _refresh_airtime_radio_params(self) -> None:
+    def _refresh_airtime_radio_params(self, *, default_radio_applied: bool = False) -> None:
+        """Rebuild the duty-cycle budgets after a config change.
+
+        ``default_radio_applied`` says the default radio was just retuned for
+        real. Only that radio can be: a change to any other sits in ``radios[]``
+        marked restart-required. Metering adopts a new modulation only for the
+        radios that actually got one, so an unrelated duty-cycle save cannot
+        quietly start charging a radio at a bandwidth its hardware has not been
+        given yet -- eight times under the truth, on the 62.5 kHz side.
+        """
         repeater_handler = getattr(self.daemon, "repeater_handler", None)
         if repeater_handler is None:
             return
@@ -166,7 +175,11 @@ class ConfigManager:
         if budgets is not None:
             # Rebuild the container even on a legacy single-radio node because
             # it owns both the cached modulation and the cached duty-cycle limit.
-            budgets.refresh()
+            adopt = set()
+            if default_radio_applied:
+                default_id = getattr(budgets, "default_radio_id", None)
+                adopt = {default_id}
+            budgets.refresh(adopt_air_for=adopt)
             repeater_handler.airtime_mgr = budgets.default
             return
 
