@@ -1,0 +1,1 @@
+import{t as e}from"./dataService-C3Lp-URp.js";export{e as useDataService};
