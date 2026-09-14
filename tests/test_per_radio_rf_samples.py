@@ -273,8 +273,12 @@ async def test_noise_floor_is_sampled_and_stored_per_radio():
 
 
 @pytest.mark.asyncio
-async def test_only_the_default_radio_reaches_stats_and_the_observer_feed():
-    """MQTT, Glass and /stats carry one noise floor per node; per-radio publishing is separate work."""
+async def test_only_the_default_radio_reaches_the_observer_feed():
+    """MQTT and Glass carry one noise floor per node; per-radio publishing is separate work.
+
+    /stats keeps the same scalar for the same reason, and reports the other
+    radios beside it rather than in it.
+    """
     handler, _, _ = _bridge_handler(default_radio_id="link")
 
     await handler._record_noise_floor_async()
@@ -296,6 +300,57 @@ async def test_a_radio_that_cannot_be_read_does_not_stop_the_others():
     assert [call.args for call in handler.storage.record_noise_floor.call_args_list] == [
         (-101.0, "link")
     ]
+
+
+@pytest.mark.asyncio
+async def test_stats_reports_every_radio_noise_floor_beside_the_scalar():
+    """Without this the sidebar can only refresh the default radio's curve live."""
+    handler, _, _ = _bridge_handler()
+
+    await handler._record_noise_floor_async()
+    stats = handler.get_stats()
+
+    assert stats["noise_floor_dbm"] == -118.0
+    assert stats["noise_floor_radios"] == [
+        {"radio_id": "local", "noise_floor_dbm": -118.0},
+        {"radio_id": "link", "noise_floor_dbm": -101.0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_single_radio_node_stats_gains_no_per_radio_noise_floor():
+    handler = _make_handler()
+
+    await handler._record_noise_floor_async()
+    stats = handler.get_stats()
+
+    assert "noise_floor_radios" not in stats
+    assert handler.get_cached_noise_floor_by_radio() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_radio_that_leaves_the_fabric_leaves_no_stale_figure():
+    handler, local, link = _bridge_handler()
+    await handler._record_noise_floor_async()
+    assert set(handler.get_cached_noise_floor_by_radio()) == {"local", "link"}
+
+    handler.dispatcher.radio.fabric.radios.pop("link")
+    await handler._record_noise_floor_async()
+
+    assert handler.get_cached_noise_floor_by_radio() == {}
+    assert "noise_floor_radios" not in handler.get_stats()
+
+
+@pytest.mark.asyncio
+async def test_a_radio_that_cannot_be_read_keeps_its_last_figure():
+    """One timed-out read should not blank a curve that was drawing fine."""
+    handler, local, link = _bridge_handler()
+    await handler._record_noise_floor_async()
+
+    link.get_noise_floor = MagicMock(side_effect=RuntimeError("modem timeout"))
+    await handler._record_noise_floor_async()
+
+    assert handler.get_cached_noise_floor_by_radio() == {"local": -118.0, "link": -101.0}
 
 
 @pytest.mark.asyncio

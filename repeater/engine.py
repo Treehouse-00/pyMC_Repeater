@@ -266,6 +266,10 @@ class RepeaterHandler(BaseHandler):
         self.noise_floor_interval = NOISE_FLOOR_INTERVAL  # 30 seconds
         self._background_task = None
         self._cached_noise_floor = None
+        # Last sample per radio id, on a fabric only. /stats reports the default
+        # radio's figure as it always has; this carries the others so a bridge's
+        # sidebar curves all advance on the same beat.
+        self._cached_noise_floor_by_radio: Dict[str, float] = {}
         # Radio hardware CRC counter per radio id (None on a single-radio node),
         # so each radio's delta is measured against its own last reading.
         self._crc_error_baselines: Dict[Optional[str], int] = {}
@@ -2448,6 +2452,10 @@ class RepeaterHandler(BaseHandler):
         """Return the last asynchronously-sampled noise floor value."""
         return self._cached_noise_floor
 
+    def get_cached_noise_floor_by_radio(self) -> Dict[str, float]:
+        """Last sample per radio id. Empty on a single-radio node."""
+        return dict(self._cached_noise_floor_by_radio)
+
     def get_stats(self) -> dict:
         runtime_config = normalize_modem_config(self.config, warn=False)
         redact_modem_tokens_in_place(runtime_config)
@@ -2569,6 +2577,14 @@ class RepeaterHandler(BaseHandler):
         radios = self.airtime_budgets.per_radio_stats()
         if radios:
             stats["airtime_radios"] = radios
+        # Only a fabric has these, and only beside the unchanged scalar above:
+        # a single-radio node's response keeps exactly the shape it had.
+        noise_by_radio = self.get_cached_noise_floor_by_radio()
+        if noise_by_radio:
+            stats["noise_floor_radios"] = [
+                {"radio_id": radio_id, "noise_floor_dbm": dbm}
+                for radio_id, dbm in noise_by_radio.items()
+            ]
         return stats
 
     def _start_background_tasks(self):
@@ -2642,7 +2658,12 @@ class RepeaterHandler(BaseHandler):
             return
 
         loop = asyncio.get_running_loop()
-        for index, (radio_id, radio) in enumerate(self._sampling_radios()):
+        sampled = self._sampling_radios()
+        # A radio that has left the fabric keeps no stale figure in /stats.
+        live_ids = {radio_id for radio_id, _ in sampled if radio_id is not None}
+        for retired in set(self._cached_noise_floor_by_radio) - live_ids:
+            self._cached_noise_floor_by_radio.pop(retired, None)
+        for index, (radio_id, radio) in enumerate(sampled):
             is_default = index == 0
             try:
                 # Run in executor so KISS modem's blocking _send_command (up to 5s timeout)
@@ -2655,6 +2676,8 @@ class RepeaterHandler(BaseHandler):
                     continue
                 if is_default:
                     self._cached_noise_floor = noise_floor
+                if radio_id is not None:
+                    self._cached_noise_floor_by_radio[radio_id] = noise_floor
                 self.storage.record_noise_floor(noise_floor, radio_id, publish=is_default)
                 logger.debug(f"Recorded noise floor: {noise_floor} dBm ({radio_id or 'default'})")
             except Exception as e:
