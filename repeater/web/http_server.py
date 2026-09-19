@@ -499,10 +499,6 @@ class StatsApp:
         if cherrypy.request.method == "OPTIONS":
             return ""
 
-        # Let API routes pass through
-        if args and args[0] == "api":
-            raise cherrypy.NotFound()
-
         # Application UI plugins: /plugins/{id}/...
         if args and args[0] == "plugins":
             if len(args) < 2:
