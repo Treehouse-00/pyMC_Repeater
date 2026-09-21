@@ -1005,7 +1005,10 @@ class MeshCoreToMqttPusher:
             "radio": radio_config or self.radio_config,
             "client_version": f"openhop_repeater/{self.app_version}",
             "repeat": repeat_state,
-            "stats": {**live_stats, "errors": 0, "queue_len": 0, **(extra_stats or {})},
+            # Defaults first: a provider that reports real figures must win over
+            # them. Spread after live_stats, as they were, they pinned errors to
+            # 0 no matter what the node had counted.
+            "stats": {"errors": 0, "queue_len": 0, **live_stats, **(extra_stats or {})},
         }
 
         radios = self._radio_map()

@@ -2454,6 +2454,18 @@ class RepeaterHandler(BaseHandler):
         """Last sample per radio id. Empty on a single-radio node."""
         return dict(self._cached_noise_floor_by_radio)
 
+    def get_crc_error_count(self) -> int:
+        """The default radio's cumulative CRC error count, straight from hardware.
+
+        The default radio's, not the node's sum, because this is the figure the
+        MeshCore wire response already reports as ``n_recv_errors`` and /stats
+        as ``crc_error_count``. Per-radio counts are stored and queryable from
+        the crc_errors table; what a single scalar means here has to match what
+        the other readers of it mean.
+        """
+        radio = self.dispatcher.radio if self.dispatcher else None
+        return int(getattr(radio, "crc_error_count", 0) or 0) if radio else 0
+
     def get_stats(self) -> dict:
         runtime_config = normalize_modem_config(self.config, warn=False)
         redact_modem_tokens_in_place(runtime_config)
@@ -2478,8 +2490,7 @@ class RepeaterHandler(BaseHandler):
         noise_floor_dbm = self.get_cached_noise_floor()
 
         # Get CRC error count from radio hardware
-        radio = self.dispatcher.radio if self.dispatcher else None
-        crc_error_count = getattr(radio, "crc_error_count", 0) if radio else 0
+        crc_error_count = self.get_crc_error_count()
 
         # Get neighbors from database
         neighbors = self.storage.get_neighbors() if self.storage else {}

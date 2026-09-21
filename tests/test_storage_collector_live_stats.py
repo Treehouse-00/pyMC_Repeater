@@ -2,15 +2,19 @@
 
 ``_get_live_stats`` is what a LetsMesh-style observer reads on every heartbeat,
 so the figures it reports have to be the node's own: both directions of airtime,
-and the default radio's noise floor rather than whichever radio sampled last.
+the default radio's noise floor rather than whichever radio sampled last, and a
+receive-error count rather than a literal zero. The last test covers the other
+half of that -- publish_status must let those figures through.
 """
 
+import json
 import sys
 import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from repeater.data_acquisition.mqtt_handler import MeshCoreToMqttPusher
 from repeater.data_acquisition.storage_collector import StorageCollector
 
 sys.modules.setdefault("psutil", types.ModuleType("psutil"))
@@ -63,6 +67,7 @@ def _handler(**overrides) -> SimpleNamespace:
             "total_rx_airtime_ms": 240_900.0,
         },
         get_cached_noise_floor=lambda: -118.0,
+        get_crc_error_count=lambda: 47,
     )
     for key, value in overrides.items():
         setattr(handler, key, value)
@@ -131,3 +136,89 @@ def test_noise_floor_is_omitted_when_the_handler_cannot_report_one():
     collector.repeater_handler = handler
 
     assert "noise_floor" not in collector._get_live_stats()
+
+
+def test_errors_reports_the_radios_crc_failures():
+    # Published as a literal 0 for as long as the field existed, which made a
+    # deaf node look like a quiet one.
+    collector = _make_collector()
+    collector.repeater_handler = _handler()
+
+    assert collector._get_live_stats()["errors"] == 47
+
+
+def test_errors_falls_back_to_zero_when_the_handler_cannot_count_them():
+    collector = _make_collector()
+    handler = _handler()
+    del handler.get_crc_error_count
+
+    collector.repeater_handler = handler
+
+    assert collector._get_live_stats()["errors"] == 0
+
+
+class _FakeIdentity:
+    def __init__(self, public_key_hex: str):
+        self._pk = bytes.fromhex(public_key_hex)
+
+    def get_public_key(self) -> bytes:
+        return self._pk
+
+
+def _publish_status(stats_provider) -> dict:
+    config = {
+        "repeater": {"node_name": "test-node", "mode": "forward"},
+        "radio": {
+            "frequency": 869618000,
+            "bandwidth": 62500,
+            "spreading_factor": 8,
+            "coding_rate": 8,
+        },
+        "mqtt_brokers": {
+            "iata_code": "LAX",
+            "status_interval": 0,
+            "brokers": [
+                {
+                    "name": "test-broker",
+                    "enabled": True,
+                    "host": "broker.example",
+                    "port": 1883,
+                    "transport": "tcp",
+                    "format": "letsmesh",
+                    "use_jwt_auth": False,
+                    "tls": {"enabled": False, "insecure": False},
+                }
+            ],
+        },
+    }
+    pusher = MeshCoreToMqttPusher(
+        local_identity=_FakeIdentity("AB" * 32),
+        config=config,
+        stats_provider=stats_provider,
+    )
+    conn = pusher.connections[0]
+    captured = []
+    conn._running = True
+    conn.client = MagicMock()
+    conn.client.publish = lambda topic, payload, retain=False, qos=0: captured.append(payload)
+
+    pusher.publish_status(state="online")
+
+    assert len(captured) == 1
+    return json.loads(captured[0])
+
+
+def test_publish_status_does_not_overwrite_a_real_error_count():
+    # The defaults used to be spread *after* live_stats, so a node that counted
+    # errors still published 0.
+    status = _publish_status(lambda: {"uptime_secs": 9, "errors": 47, "queue_len": 2})
+
+    assert status["stats"]["errors"] == 47
+    assert status["stats"]["queue_len"] == 2
+
+
+def test_publish_status_still_defaults_the_fields_a_provider_omits():
+    status = _publish_status(lambda: {"uptime_secs": 9})
+
+    assert status["stats"]["errors"] == 0
+    assert status["stats"]["queue_len"] == 0
