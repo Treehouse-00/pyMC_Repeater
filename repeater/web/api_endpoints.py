@@ -27,7 +27,7 @@ from repeater.companion.utils import (
     trim_companion_contacts_to_fit,
     validate_companion_config_capacity,
 )
-from repeater.config import resolve_storage_dir
+from repeater.config import resolve_storage_dir, validate_fabric_config
 from repeater.handler_helpers.acl import role_name as acl_role_name
 from repeater.modem_config import (
     LEGACY_MODEM_RADIO_TYPES,
@@ -3580,6 +3580,14 @@ class APIEndpoints:
 
                 if radio_disabled:
                     add_warning("radio_type", "Radio is disabled (radio_type none/null/off)")
+
+                # Fabric fan-out otherwise fails only once the radio stack is
+                # built, which is too late to be worth reporting: the restart it
+                # blocks is the one that would have surfaced it.
+                try:
+                    validate_fabric_config(config_yaml)
+                except ValueError as exc:
+                    add_error("fabric", str(exc))
 
             valid = len(errors) == 0
             return self._success(
@@ -8493,6 +8501,52 @@ class APIEndpoints:
                 "logging",
                 "radio_type",
             }
+
+            # Structural check first, before anything is written. The loop below
+            # also rejects a non-list radios, but only once it has already
+            # merged whatever sections came before it in the request -- a
+            # failure that still changes self.config. Checking here also keeps
+            # the message about the real problem: a malformed radios section
+            # otherwise reaches the fan-out check as "one radio" and is reported
+            # as a radio-count error.
+            if "radios" in imported_config:
+                incoming_radios = imported_config["radios"]
+                if incoming_radios is not None and not isinstance(incoming_radios, list):
+                    return self._error("radios must be a list or null")
+
+            # Fabric fan-out is only checked when the radio stack is built, so
+            # an impossible combination would persist here and then refuse to
+            # start at the next restart. Check the merged result before touching
+            # self.config, mirroring exactly how the loop below merges each of
+            # these two sections.
+            if "fabric" in imported_config or "radios" in imported_config:
+                prospective = {}
+
+                if "fabric" in imported_config:
+                    incoming_fabric = imported_config["fabric"]
+                    current_fabric = self.config.get("fabric")
+                    if isinstance(incoming_fabric, dict) and isinstance(current_fabric, dict):
+                        # Dict-update merge, as the loop's else-branch performs.
+                        prospective["fabric"] = {**current_fabric, **incoming_fabric}
+                    else:
+                        # Anything else replaces the section wholesale -- including
+                        # ``fabric: null``, which wipes it. That is how an operator
+                        # clears fan-out left invalid by an older build, so
+                        # validating the old section here would reject the very
+                        # import that repairs the node.
+                        prospective["fabric"] = incoming_fabric
+                else:
+                    prospective["fabric"] = self.config.get("fabric")
+
+                if "radios" in imported_config:
+                    prospective["radios"] = imported_config["radios"]
+                else:
+                    prospective["radios"] = self.config.get("radios")
+
+                try:
+                    validate_fabric_config(prospective)
+                except ValueError as exc:
+                    return self._error(str(exc))
 
             updated_sections = []
             restart_required = False

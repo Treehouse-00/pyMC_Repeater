@@ -921,6 +921,8 @@ def _apply_fabric_tx_mode(fabric, mode: str) -> None:
     raise ValueError(f"Unknown fabric.tx_mode={mode!r}. Supported: default, sticky, bridge")
 
 
+FABRIC_TX_MODES = ("default", "sticky", "bridge")
+
 FABRIC_ORIGIN_TX_MODES = ("default", "all")
 
 # ``local_tx_mode`` is the option's original name, still read so configs written
@@ -1003,6 +1005,40 @@ def _validate_fabric_fanout(fabric_cfg, tx_mode: str, radio_count: int) -> tuple
         key = _fabric_origin_tx_entries(fabric_cfg)[0][0]
         raise ValueError(f"fabric.{key}=all requires exactly two radios (got {radio_count})")
     return repeat_on_ingress, origin_tx
+
+
+def validate_fabric_config(config: dict) -> tuple:
+    """Run ``build_radio_stack``'s fabric checks against a whole config mapping.
+
+    Those checks otherwise only run when the daemon starts, so a combination
+    with no defined meaning is accepted by the config API, written to disk, and
+    only refuses to come up at the next restart -- by which time the caller that
+    could have fixed it is long gone. Callers that persist a ``fabric:`` or
+    ``radios:`` edit run this first and report the ValueError instead.
+
+    Returns the parsed ``(repeat_on_ingress, origin_tx)``.
+    """
+    fabric_cfg = config.get("fabric") if isinstance(config.get("fabric"), dict) else {}
+    radios_cfg = config.get("radios")
+
+    tx_mode = str(fabric_cfg.get("tx_mode", "default"))
+
+    # Only reject a tx_mode the daemon would actually try to apply.
+    # build_radio_stack calls _apply_fabric_tx_mode -- the thing that raises on
+    # an unknown mode -- only for a non-empty ``radios:`` list or use_fabric.
+    # A legacy single-radio node carrying a stale or misspelled tx_mode boots
+    # fine today, so refusing its unrelated imports would be this check
+    # inventing a failure rather than reporting one.
+    has_radios = isinstance(radios_cfg, list) and len(radios_cfg) > 0
+    tx_mode_is_applied = has_radios or bool(fabric_cfg.get("use_fabric", False))
+    # An empty tx_mode is "default" to _apply_fabric_tx_mode; accept it here too.
+    if tx_mode_is_applied and (tx_mode.strip().lower() or "default") not in FABRIC_TX_MODES:
+        raise ValueError(
+            f"Unknown fabric.tx_mode={tx_mode!r}. Supported: " + ", ".join(FABRIC_TX_MODES)
+        )
+
+    radio_count = len(radios_cfg) if has_radios else 1
+    return _validate_fabric_fanout(fabric_cfg, tx_mode, radio_count)
 
 
 # Air-setting defaults per radio_type, mirroring ``get_radio_for_board``. The
