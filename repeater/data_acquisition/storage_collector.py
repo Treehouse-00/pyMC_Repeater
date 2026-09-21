@@ -217,7 +217,8 @@ class StorageCollector:
 
         # Add airtime stats
         if airtime_stats:
-            stats["tx_air_secs"] = airtime_stats["total_airtime_ms"] / 1000
+            stats["tx_air_secs"] = int(airtime_stats["total_airtime_ms"] / 1000)
+            stats["rx_air_secs"] = int(airtime_stats.get("total_rx_airtime_ms", 0) / 1000)
             stats["current_airtime_ms"] = airtime_stats["current_airtime_ms"]
             stats["utilization_percent"] = airtime_stats["utilization_percent"]
 
