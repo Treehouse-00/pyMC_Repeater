@@ -211,12 +211,26 @@ class ProtocolRequestHelper:
         total_air_time_secs = 0
         total_rx_air_time_secs = 0
         if self.engine:
-            am = getattr(self.engine, "airtime_mgr", None) or getattr(
-                self.engine, "airtime_manager", None
-            )
-            if am is not None:
-                total_air_time_secs = int(getattr(am, "total_airtime_ms", 0) or 0) // 1000
-                total_rx_air_time_secs = int(getattr(am, "total_rx_airtime_ms", 0) or 0) // 1000
+            # The whole node's airtime, not the default radio's channel: this is
+            # the MeshCore wire field other nodes read, and a bridge that
+            # reported one of its two radios would be under-stating itself.
+            stats = None
+            node_stats = getattr(self.engine, "airtime_stats", None)
+            if callable(node_stats):
+                try:
+                    stats = node_stats()
+                except Exception:
+                    stats = None
+            if stats:
+                total_air_time_secs = int(stats.get("total_airtime_ms", 0) or 0) // 1000
+                total_rx_air_time_secs = int(stats.get("total_rx_airtime_ms", 0) or 0) // 1000
+            else:
+                am = getattr(self.engine, "airtime_mgr", None) or getattr(
+                    self.engine, "airtime_manager", None
+                )
+                if am is not None:
+                    total_air_time_secs = int(getattr(am, "total_airtime_ms", 0) or 0) // 1000
+                    total_rx_air_time_secs = int(getattr(am, "total_rx_airtime_ms", 0) or 0) // 1000
 
         # Routing stats (flood/direct and dups - from engine when available)
         n_sent_flood = getattr(self.engine, "sent_flood_count", 0) if self.engine else 0

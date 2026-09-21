@@ -150,16 +150,40 @@ class ConfigManager:
                         return False
 
             self._sync_repeater_handler_radio_config(radio_cfg)
-            self._refresh_airtime_radio_params()
+            self._refresh_airtime_radio_params(default_radio_applied=True)
             logger.info("Applied live radio configuration to running daemon")
             return True
         except Exception as e:
             logger.error(f"Failed to apply live radio config: {e}", exc_info=True)
             return False
 
-    def _refresh_airtime_radio_params(self) -> None:
+    def _refresh_airtime_radio_params(self, *, default_radio_applied: bool = False) -> None:
+        """Rebuild the duty-cycle budgets after a config change.
+
+        ``default_radio_applied`` says the default radio was just retuned for
+        real. Only that radio can be: a change to any other sits in ``radios[]``
+        marked restart-required. Metering adopts a new modulation only for the
+        radios that actually got one, so an unrelated duty-cycle save cannot
+        quietly start charging a radio at a bandwidth its hardware has not been
+        given yet -- eight times under the truth, on the 62.5 kHz side.
+        """
         repeater_handler = getattr(self.daemon, "repeater_handler", None)
-        airtime_mgr = getattr(repeater_handler, "airtime_mgr", None) if repeater_handler else None
+        if repeater_handler is None:
+            return
+
+        budgets = getattr(repeater_handler, "airtime_budgets", None)
+        if budgets is not None:
+            # Rebuild the container even on a legacy single-radio node because
+            # it owns both the cached modulation and the cached duty-cycle limit.
+            adopt = set()
+            if default_radio_applied:
+                default_id = getattr(budgets, "default_radio_id", None)
+                adopt = {default_id}
+            budgets.refresh(adopt_air_for=adopt)
+            repeater_handler.airtime_mgr = budgets.default
+            return
+
+        airtime_mgr = getattr(repeater_handler, "airtime_mgr", None)
         if airtime_mgr is None or not hasattr(airtime_mgr, "refresh_radio_params"):
             return
         # Use the full radio section so preamble_length is included; the live
@@ -411,11 +435,17 @@ class ConfigManager:
                 logger.info("radio_type change detected; service restart required")
                 live_update_ok = False
 
+            if "radios" in sections:
+                logger.info("Non-default radio change detected; service restart required")
+                live_update_ok = False
+
             if "kiss" in sections and self._kiss_transport_restart_required():
                 live_update_ok = False
 
             if "radio" in sections:
                 live_update_ok = self._apply_live_radio_config() and live_update_ok
+            elif "duty_cycle" in sections:
+                self._refresh_airtime_radio_params()
 
             if "http" in sections:
                 live_update_ok = self._apply_live_http_config() and live_update_ok

@@ -2650,12 +2650,12 @@ class TestMissedEngineBranches:
     @pytest.mark.asyncio
     async def test_record_crc_errors_async_records_positive_delta(self, handler):
         handler.dispatcher.radio.crc_error_count = 9
-        handler._last_crc_error_count = 4
+        handler._crc_error_baselines[None] = 4
 
         await handler._record_crc_errors_async()
 
-        handler.storage.record_crc_errors.assert_called_once_with(5)
-        assert handler._last_crc_error_count == 9
+        handler.storage.record_crc_errors.assert_called_once_with(5, None, publish=True)
+        assert handler._crc_error_baselines[None] == 9
 
     @pytest.mark.asyncio
     async def test_record_noise_floor_async_caches_and_persists(self, handler):
@@ -2663,7 +2663,7 @@ class TestMissedEngineBranches:
             await handler._record_noise_floor_async()
 
         assert handler._cached_noise_floor == -117.5
-        handler.storage.record_noise_floor.assert_called_once_with(-117.5)
+        handler.storage.record_noise_floor.assert_called_once_with(-117.5, None, publish=True)
 
     @pytest.mark.asyncio
     async def test_send_periodic_advert_async_success_and_failure(self, handler):
@@ -2917,7 +2917,7 @@ class TestEngineTransmissionAndBackgroundLifecycle:
 
         with patch.object(handler, "get_noise_floor", return_value=0.0):
             await handler._record_noise_floor_async()
-        handler.storage.record_noise_floor.assert_called_once_with(0.0)
+        handler.storage.record_noise_floor.assert_called_once_with(0.0, None, publish=True)
         assert handler._cached_noise_floor == 0.0
 
         with patch.object(handler, "get_noise_floor", side_effect=RuntimeError("noise fail")):
@@ -2933,7 +2933,7 @@ class TestEngineTransmissionAndBackgroundLifecycle:
 
         # Restore storage and force write error on positive delta.
         handler.storage = MagicMock()
-        handler._last_crc_error_count = 1
+        handler._crc_error_baselines[None] = 1
         handler.dispatcher.radio.crc_error_count = 3
         handler.storage.record_crc_errors.side_effect = RuntimeError("crc write fail")
 

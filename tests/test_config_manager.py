@@ -1,6 +1,6 @@
 import math
 
-from repeater.airtime import AirtimeManager
+from repeater.airtime import AirtimeBudgets, AirtimeManager
 from repeater.config_manager import ConfigManager
 
 
@@ -216,3 +216,67 @@ def test_failed_live_radio_apply_leaves_airtime_manager_unchanged():
 
     assert airtime_mgr.spreading_factor == 7
     assert math.isclose(airtime_mgr.calculate_airtime(50), 97.536, rel_tol=1e-9)
+
+
+def test_live_duty_cycle_update_refreshes_the_cached_limit():
+    config = {
+        "radio": {
+            "frequency": 868000000,
+            "bandwidth": 125000,
+            "spreading_factor": 7,
+            "coding_rate": 5,
+            "preamble_length": 8,
+        },
+        "duty_cycle": {"max_airtime_per_minute": 3600, "enforcement_enabled": True},
+    }
+    budgets = AirtimeBudgets(config)
+    handler = _DummyRepeaterHandler(config)
+    handler.airtime_budgets = budgets
+    handler.airtime_mgr = budgets.default
+    daemon = _DummyDaemon(config, _DummySX1262Radio())
+    daemon.repeater_handler = handler
+    manager = ConfigManager("/tmp/config.yaml", config, daemon)
+
+    config["duty_cycle"]["max_airtime_per_minute"] = 600
+    assert manager.live_update_daemon(["duty_cycle"])
+
+    assert budgets.default.max_airtime_per_minute == 600
+
+
+def test_non_default_radio_change_requires_restart_and_keeps_runtime_metering():
+    config = {
+        "radio": {
+            "frequency": 910100000,
+            "bandwidth": 500000,
+            "spreading_factor": 7,
+            "coding_rate": 5,
+            "preamble_length": 8,
+        },
+        "radios": [
+            {
+                "id": "local",
+                "radio_type": "sx1262",
+                "radio": {"frequency": 910100000, "bandwidth": 500000},
+            },
+            {
+                "id": "link",
+                "radio_type": "sx1262",
+                "radio": {"frequency": 910525000, "bandwidth": 62500},
+            },
+        ],
+        "fabric": {"use_fabric": True, "default_radio": "local"},
+        "duty_cycle": {"max_airtime_per_minute": 3600, "enforcement_enabled": True},
+    }
+    budgets = AirtimeBudgets(config)
+    old_airtime = budgets.for_radio("link").calculate_airtime(50)
+    handler = _DummyRepeaterHandler(config)
+    handler.airtime_budgets = budgets
+    handler.airtime_mgr = budgets.default
+    daemon = _DummyDaemon(config, _DummySX1262Radio())
+    daemon.repeater_handler = handler
+    manager = ConfigManager("/tmp/config.yaml", config, daemon)
+
+    config["radios"][1]["radio"]["bandwidth"] = 500000
+    assert manager.live_update_daemon(["radios"]) is False
+
+    assert budgets.for_radio("link").calculate_airtime(50) == old_airtime

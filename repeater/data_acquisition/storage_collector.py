@@ -5,7 +5,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from repeater.config import resolve_storage_dir
+from repeater.config import build_radio_profiles, resolve_storage_dir
 
 from .mqtt_handler import MeshCoreToMqttPusher
 from .rrdtool_handler import RRDToolHandler
@@ -13,6 +13,31 @@ from .sqlite_handler import SQLiteHandler
 from .storage_utils import PacketRecord
 
 logger = logging.getLogger("StorageCollector")
+
+
+def _node_airtime_stats(repeater_handler) -> Optional[dict]:
+    """The whole node's airtime figures, however old the handler is.
+
+    Prefers ``airtime_stats()``, which sums the channels a multi-radio node
+    meters separately. Falls back to the default radio's manager for a handler
+    that predates it, and to None when there is no handler at all.
+    """
+    if repeater_handler is None:
+        return None
+    node_stats = getattr(repeater_handler, "airtime_stats", None)
+    if callable(node_stats):
+        try:
+            return node_stats()
+        except Exception as exc:
+            logger.debug(f"Node airtime stats unavailable: {exc}")
+    airtime_mgr = getattr(repeater_handler, "airtime_mgr", None)
+    if airtime_mgr is None:
+        return None
+    try:
+        return airtime_mgr.get_stats()
+    except Exception as exc:
+        logger.debug(f"Airtime stats unavailable: {exc}")
+        return None
 
 
 class StorageCollector:
@@ -37,6 +62,11 @@ class StorageCollector:
         self._db_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="storage-writer"
         )
+
+        # Radio count is fixed at boot (build_radio_stack opens the hardware),
+        # so this is resolved once rather than per packet. Air settings can
+        # still change at runtime; those are re-read when status is published.
+        self._multi_radio = len(build_radio_profiles(config)) > 1
 
         self.storage_dir = resolve_storage_dir(config)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -164,8 +194,9 @@ class StorageCollector:
 
         uptime_secs = int(time.time() - self.repeater_handler.start_time)
 
-        # Get airtime stats
-        airtime_stats = self.repeater_handler.airtime_mgr.get_stats()
+        # Get airtime stats -- the node's, not the default radio's channel, so
+        # a bridge's stored history covers every radio it transmits on.
+        airtime_stats = _node_airtime_stats(self.repeater_handler) or {}
 
         # Get latest noise floor from database
         noise_floor = None
@@ -196,7 +227,12 @@ class StorageCollector:
 
         return stats
 
-    def record_packet(self, packet_record: dict, skip_mqtt_if_invalid: bool = True):
+    def record_packet(
+        self,
+        packet_record: dict,
+        skip_mqtt: bool = False,
+        tx_egress: Optional[list] = None,
+    ):
         """Record a packet to storage and publish it.
 
         All blocking work — the SQLite write, the cumulative-counts aggregate, the
@@ -206,13 +242,19 @@ class StorageCollector:
 
         Args:
             packet_record: Dictionary containing packet information
-            skip_mqtt_if_invalid: If True, don't publish packets with drop_reason to mqtt
+            skip_mqtt: The caller determined this packet is invalid (it could not
+                be parsed); withhold it from the brokers. Classifying a packet is
+                the caller's job — a drop_reason alone does not mean invalid, as
+                duplicates, policy drops and traces all carry one.
+            tx_egress: One entry per physical send on a node with two or more
+                radios, stored beside the packet. Kept off packet_record so it
+                does not ride along on every websocket, Glass and MQTT publish.
         """
         logger.debug(
             f"Recording packet: type={packet_record.get('type')}, "
             f"transmitted={packet_record.get('transmitted')}"
         )
-        self._submit_db(self._record_packet_blocking, packet_record, skip_mqtt_if_invalid)
+        self._submit_db(self._record_packet_blocking, packet_record, skip_mqtt, tx_egress)
 
     def _submit_db(self, fn, *args):
         """Run a blocking storage operation on the dedicated writer thread.
@@ -232,11 +274,17 @@ class StorageCollector:
         except Exception as e:
             logger.error(f"Storage writer task failed: {e}", exc_info=True)
 
-    def _record_packet_blocking(self, packet_record: dict, skip_mqtt: bool):
+    def _record_packet_blocking(
+        self, packet_record: dict, skip_mqtt: bool, tx_egress: Optional[list] = None
+    ):
         """Store, aggregate, update metrics, and publish one packet (writer thread)."""
         packet_id = self.sqlite_handler.store_packet(packet_record)
         if packet_id is not None:
             packet_record["id"] = packet_id
+            if tx_egress:
+                self.sqlite_handler.store_packet_egress(
+                    packet_id, packet_record.get("timestamp", time.time()), tx_egress
+                )
 
         if self.rrd_handler is not None:
             cumulative_counts = self.sqlite_handler.get_cumulative_counts()
@@ -250,6 +298,16 @@ class StorageCollector:
         Only fast, per-packet work runs here. The aggregate stats broadcast is
         driven separately by _stats_broadcast_loop so the writer thread is not
         held by the multi-second get_packet_stats(24h) query.
+
+        ``skip_mqtt`` withholds a packet the caller judged invalid (a malformed
+        advert, an empty payload, an over-long path) from the brokers only. It
+        is still stored and still reaches Glass and the dashboard, which are
+        the surfaces an operator debugs their own RF from; what it must not do
+        is feed a network-wide observer a packet this node could not parse.
+
+        The caller's judgement is taken as final here. Re-deriving it from
+        ``drop_reason`` would silence traces, duplicates and policy drops,
+        which all carry a reason and are all packets an observer wants.
         """
         self._publish_to_glass(packet_record, "packet")
 
@@ -258,6 +316,13 @@ class StorageCollector:
                 self.websocket_broadcast_packet(packet_record)
             except Exception as e:
                 logger.debug(f"WebSocket broadcast failed: {e}")
+
+        if skip_mqtt:
+            logger.debug(
+                "Skipping mqtt publish for invalid packet: %s",
+                packet_record.get("drop_reason"),
+            )
+            return
 
         self._publish_packet_to_mqtt(packet_record)
 
@@ -279,11 +344,9 @@ class StorageCollector:
             ),
             "mode": self.config.get("repeater", {}).get("mode", "forward"),
         }
-        airtime_mgr = getattr(self.repeater_handler, "airtime_mgr", None)
-        if airtime_mgr is not None:
-            airtime_stats = airtime_mgr.get_stats()
-            if airtime_stats:
-                system_stats["utilization_percent"] = airtime_stats["utilization_percent"]
+        airtime_stats = _node_airtime_stats(self.repeater_handler)
+        if airtime_stats:
+            system_stats["utilization_percent"] = airtime_stats["utilization_percent"]
         if self._last_noise_floor_dbm is not None:
             system_stats["noise_floor_dbm"] = self._last_noise_floor_dbm
         if self.advert_stats_getter is not None:
@@ -300,7 +363,9 @@ class StorageCollector:
 
         payload: Dict[str, Any] = {"system_stats": system_stats}
         if self._stats_broadcast_seq % self.PACKET_STATS_EVERY_N_BEATS == 0:
-            payload["packet_stats"] = self.sqlite_handler.get_packet_stats(hours=24)
+            payload["packet_stats"] = self.sqlite_handler.get_packet_stats(
+                hours=24, radio_profiles=self._radio_profiles()
+            )
         self._stats_broadcast_seq += 1
 
         self.websocket_broadcast_stats(payload)
@@ -326,6 +391,10 @@ class StorageCollector:
         ``packet_record['airtime_ms']``, populated upstream by
         RepeaterHandler._build_packet_record using the Semtech reference
         time-on-air formula. No recomputation is needed here.
+
+        On a multi-radio node the payload also carries the ingress radio and
+        every successful egress, which an observer resolves to frequencies
+        through the ``radios`` map in this node's status message.
         """
         if not self.mqtt_handler:
             return
@@ -338,7 +407,10 @@ class StorageCollector:
 
             node_name = self.config.get("repeater", {}).get("node_name", "Unknown")
             packet = PacketRecord.from_packet_record(
-                packet_record, origin=node_name, origin_id=self.mqtt_handler.public_key
+                packet_record,
+                origin=node_name,
+                origin_id=self.mqtt_handler.public_key,
+                include_radio_ids=self._multi_radio,
             )
 
             if packet:
@@ -371,11 +443,26 @@ class StorageCollector:
             self.mqtt_handler.publish_mqtt(advert_record, "advert")
         self._publish_to_glass(advert_record, "advert")
 
-    def record_noise_floor(self, noise_floor_dbm: float):
-        """Record noise floor to storage and defer network publishing to background tasks."""
-        self._last_noise_floor_dbm = noise_floor_dbm
+    def record_noise_floor(
+        self,
+        noise_floor_dbm: float,
+        radio_id: Optional[str] = None,
+        *,
+        publish: bool = True,
+    ):
+        """Record noise floor to storage and defer network publishing to background tasks.
+
+        ``radio_id`` is the radio the sample was read from, NULL on a
+        single-radio node. Only the default radio's sample is published: the
+        observer feed and Glass carry one noise floor per node, and doubling
+        that cadence is a change of its own (per-radio publishing is not in this
+        work). The published record keeps its existing shape.
+        """
         noise_record = {"timestamp": time.time(), "noise_floor_dbm": noise_floor_dbm}
-        self.sqlite_handler.store_noise_floor(noise_record)
+        self.sqlite_handler.store_noise_floor({**noise_record, "radio_id": radio_id})
+        if not publish:
+            return
+        self._last_noise_floor_dbm = noise_floor_dbm
         self._schedule_background(
             self._deferred_publish_noise_floor,
             noise_record,
@@ -394,10 +481,22 @@ class StorageCollector:
             self.mqtt_handler.publish_mqtt(noise_record, "noise_floor")
         self._publish_to_glass(noise_record, "noise_floor")
 
-    def record_crc_errors(self, count: int):
-        """Record a batch of CRC errors detected since last poll and defer publishing."""
+    def record_crc_errors(
+        self,
+        count: int,
+        radio_id: Optional[str] = None,
+        *,
+        publish: bool = True,
+    ):
+        """Record a batch of CRC errors detected since last poll and defer publishing.
+
+        Publishing follows the same rule as ``record_noise_floor``: every radio's
+        delta is stored, only the default radio's is published.
+        """
         crc_record = {"timestamp": time.time(), "count": count}
-        self.sqlite_handler.store_crc_errors(crc_record)
+        self.sqlite_handler.store_crc_errors({**crc_record, "radio_id": radio_id})
+        if not publish:
+            return
         self._schedule_background(
             self._deferred_publish_crc_errors,
             crc_record,
@@ -416,11 +515,19 @@ class StorageCollector:
             self.mqtt_handler.publish_mqtt(crc_record, "crc_errors")
         self._publish_to_glass(crc_record, "crc_errors")
 
-    def get_crc_error_count(self, hours: int = 24) -> int:
-        return self.sqlite_handler.get_crc_error_count(hours)
+    def get_crc_error_count(self, hours: int = 24, radio_id: Optional[str] = None) -> int:
+        return self.sqlite_handler.get_crc_error_count(hours, radio_id=radio_id)
 
-    def get_crc_error_history(self, hours: int = 24, limit: int = None) -> list:
-        return self.sqlite_handler.get_crc_error_history(hours, limit)
+    def get_crc_error_history(
+        self,
+        hours: int = 24,
+        limit: int = None,
+        radio_id: Optional[str] = None,
+        radio_profiles: Optional[list] = None,
+    ) -> list:
+        return self.sqlite_handler.get_crc_error_history(
+            hours, limit, radio_id=radio_id, radio_profiles=radio_profiles
+        )
 
     def get_policy_event_counts(
         self,
@@ -440,16 +547,26 @@ class StorageCollector:
         end_timestamp: float,
         bucket_seconds: int = 300,
         severe_attempt_threshold: int = 4,
+        radio_profiles: Optional[list] = None,
     ) -> dict:
         return self.sqlite_handler.get_lbt_diagnostics(
             start_timestamp=start_timestamp,
             end_timestamp=end_timestamp,
             bucket_seconds=bucket_seconds,
             severe_attempt_threshold=severe_attempt_threshold,
+            radio_profiles=radio_profiles,
         )
 
-    def get_packet_stats(self, hours: int = 24) -> dict:
-        return self.sqlite_handler.get_packet_stats(hours)
+    def _radio_profiles(self) -> Optional[list]:
+        """Air settings of the configured radios, read from the live config."""
+        try:
+            return build_radio_profiles(self.config)
+        except Exception as e:
+            logger.debug(f"Radio profiles unavailable for packet stats: {e}")
+            return None
+
+    def get_packet_stats(self, hours: int = 24, radio_profiles: Optional[list] = None) -> dict:
+        return self.sqlite_handler.get_packet_stats(hours, radio_profiles=radio_profiles)
 
     def get_recent_packets(self, limit: int = 100) -> list:
         return self.sqlite_handler.get_recent_packets(limit)
@@ -484,9 +601,28 @@ class StorageCollector:
         bw_hz: int = 62500,
         cr: int = 5,
         preamble: int = 17,
+        radio_profiles: Optional[list] = None,
     ) -> dict:
         return self.sqlite_handler.get_airtime_buckets(
-            start_timestamp, end_timestamp, bucket_seconds, sf, bw_hz, cr, preamble
+            start_timestamp,
+            end_timestamp,
+            bucket_seconds,
+            sf,
+            bw_hz,
+            cr,
+            preamble,
+            radio_profiles=radio_profiles,
+        )
+
+    def get_radio_packet_rates(
+        self,
+        start_timestamp: float,
+        end_timestamp: float,
+        bucket_seconds: int = 3600,
+        radio_profiles: Optional[list] = None,
+    ) -> dict:
+        return self.sqlite_handler.get_radio_packet_rates(
+            start_timestamp, end_timestamp, bucket_seconds, radio_profiles=radio_profiles
         )
 
     def get_packet_by_hash(self, packet_hash: str) -> Optional[dict]:
@@ -503,6 +639,8 @@ class StorageCollector:
         hours: int = 24,
         limit: int = 1000,
         bucket_seconds: Optional[int] = None,
+        radio_id: Optional[str] = None,
+        by_radio: bool = False,
     ) -> list:
         return self.sqlite_handler.get_neighbor_link_history(
             peer_hash=peer_hash,
@@ -510,6 +648,8 @@ class StorageCollector:
             hours=hours,
             limit=limit,
             bucket_seconds=bucket_seconds,
+            radio_id=radio_id,
+            by_radio=by_radio,
         )
 
     def get_rrd_data(
@@ -572,8 +712,8 @@ class StorageCollector:
             logger.warning("Falling back to SQLite for packet type stats")
         return self.sqlite_handler.get_packet_type_stats(hours)
 
-    def get_route_stats(self, hours: int = 24) -> dict:
-        return self.sqlite_handler.get_route_stats(hours)
+    def get_route_stats(self, hours: int = 24, radio_profiles: Optional[list] = None) -> dict:
+        return self.sqlite_handler.get_route_stats(hours, radio_profiles=radio_profiles)
 
     def get_neighbors(self) -> dict:
         return self.sqlite_handler.get_neighbors()
@@ -622,11 +762,20 @@ class StorageCollector:
     def cleanup_old_data(self, days: int = 7, companion_events_days: Optional[int] = None):
         self.sqlite_handler.cleanup_old_data(days, companion_events_days=companion_events_days)
 
-    def get_noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0) -> list:
-        return self.sqlite_handler.get_noise_floor_history(hours, limit, offset)
+    def get_noise_floor_history(
+        self,
+        hours: int = 24,
+        limit: int = None,
+        offset: int = 0,
+        radio_id: Optional[str] = None,
+        radio_profiles: Optional[list] = None,
+    ) -> list:
+        return self.sqlite_handler.get_noise_floor_history(
+            hours, limit, offset, radio_id=radio_id, radio_profiles=radio_profiles
+        )
 
-    def get_noise_floor_stats(self, hours: int = 24) -> dict:
-        return self.sqlite_handler.get_noise_floor_stats(hours)
+    def get_noise_floor_stats(self, hours: int = 24, radio_id: Optional[str] = None) -> dict:
+        return self.sqlite_handler.get_noise_floor_stats(hours, radio_id=radio_id)
 
     def close(self):
         # Stop the stats broadcast thread.

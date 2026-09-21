@@ -27,7 +27,7 @@ from repeater.companion.utils import (
     trim_companion_contacts_to_fit,
     validate_companion_config_capacity,
 )
-from repeater.config import resolve_storage_dir
+from repeater.config import resolve_storage_dir, validate_fabric_config
 from repeater.handler_helpers.acl import role_name as acl_role_name
 from repeater.modem_config import (
     LEGACY_MODEM_RADIO_TYPES,
@@ -1851,6 +1851,9 @@ class APIEndpoints:
             if daemon is not None:
                 meta = getattr(daemon, "radio_stack_meta", None) or {}
             stats["radio_stack"] = meta
+            # Authoritative per-radio air settings, so clients never have to infer
+            # which profile applies to which radio of a Fabric.
+            stats["radio_profiles"] = self._active_radio_profiles()
             stats["site_name"] = self.config.get("web", {}).get("site_name", "")
             stats["version"] = __version__
             try:
@@ -3578,6 +3581,14 @@ class APIEndpoints:
                 if radio_disabled:
                     add_warning("radio_type", "Radio is disabled (radio_type none/null/off)")
 
+                # Fabric fan-out otherwise fails only once the radio stack is
+                # built, which is too late to be worth reporting: the restart it
+                # blocks is the one that would have surfaced it.
+                try:
+                    validate_fabric_config(config_yaml)
+                except ValueError as exc:
+                    add_error("fabric", str(exc))
+
             valid = len(errors) == 0
             return self._success(
                 {
@@ -3868,7 +3879,9 @@ class APIEndpoints:
     def packet_stats(self, hours=24):
         try:
             hours = int(hours)
-            stats = self._get_storage().get_packet_stats(hours=hours)
+            stats = self._get_storage().get_packet_stats(
+                hours=hours, radio_profiles=self._active_radio_profiles()
+            )
             return self._success(stats)
         except Exception as e:
             logger.error(f"Error getting packet stats: {e}")
@@ -3890,7 +3903,9 @@ class APIEndpoints:
     def route_stats(self, hours=24):
         try:
             hours = int(hours)
-            stats = self._get_storage().get_route_stats(hours=hours)
+            stats = self._get_storage().get_route_stats(
+                hours=hours, radio_profiles=self._active_radio_profiles()
+            )
             return self._success(stats)
         except Exception as e:
             logger.error(f"Error getting route stats: {e}")
@@ -3912,7 +3927,8 @@ class APIEndpoints:
             if row_limit < 1:
                 raise ValueError("limit must be >= 1")
 
-            links = tracker.snapshot(active_within_seconds=active_window)
+            radio_ids = [profile.get("radio_id") for profile in self._active_radio_profiles()]
+            links = tracker.snapshot(active_within_seconds=active_window, radio_ids=radio_ids)
             links = links[:row_limit]
             return self._success(
                 {
@@ -3931,7 +3947,14 @@ class APIEndpoints:
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def neighbor_link_history(
-        self, peer_hash=None, path_hash_size=None, hours=24, limit=1000, bucket_seconds=None
+        self,
+        peer_hash=None,
+        path_hash_size=None,
+        hours=24,
+        limit=1000,
+        bucket_seconds=None,
+        radio_id=None,
+        by_radio=None,
     ):
         try:
             if not peer_hash:
@@ -3943,6 +3966,8 @@ class APIEndpoints:
             window_hours = int(hours)
             row_limit = int(limit)
             bucket_s = max(60, int(bucket_seconds)) if bucket_seconds is not None else None
+            radio = str(radio_id).strip() if radio_id else None
+            split = str(by_radio).strip().lower() in ("1", "true", "yes") if by_radio else False
 
             rows = self._get_storage().get_neighbor_link_history(
                 peer_hash=str(peer_hash),
@@ -3950,6 +3975,8 @@ class APIEndpoints:
                 hours=window_hours,
                 limit=row_limit,
                 bucket_seconds=bucket_s,
+                radio_id=radio,
+                by_radio=split,
             )
             data = {
                 "peer_hash": str(peer_hash).upper(),
@@ -3958,9 +3985,13 @@ class APIEndpoints:
                 "limit": row_limit,
                 "count": len(rows),
             }
+            if radio:
+                data["radio_id"] = radio
             if bucket_s is not None:
                 data["bucket_seconds"] = bucket_s
                 data["buckets"] = rows
+                if split:
+                    data["by_radio"] = True
             else:
                 data["rows"] = rows
             return self._success(data)
@@ -4080,6 +4111,28 @@ class APIEndpoints:
             logger.error(f"Error getting airtime data: {e}")
             return self._error(e)
 
+    def _active_radio_profiles(self) -> list:
+        """Air settings of the radios currently on the air, in configured order.
+
+        Rebuilt from the live config rather than read from the boot-time
+        ``radio_stack_meta`` snapshot, so a live radio reconfiguration is
+        reflected without a restart. Falls back to the daemon's snapshot if the
+        config cannot be read.
+        """
+        try:
+            from repeater.config import build_radio_profiles
+
+            profiles = build_radio_profiles(self.config)
+            if profiles:
+                return profiles
+        except Exception as e:
+            logger.warning(f"Could not derive radio profiles from config: {e}")
+
+        daemon = getattr(self, "daemon_instance", None)
+        meta = getattr(daemon, "radio_stack_meta", None) or {} if daemon is not None else {}
+        snapshot = meta.get("radio_profiles")
+        return list(snapshot) if isinstance(snapshot, list) else []
+
     @cherrypy.expose
     @cherrypy.tools.json_out()
     def airtime_chart_data(
@@ -4095,7 +4148,15 @@ class APIEndpoints:
         """Server-side aggregated airtime utilization for chart rendering.
 
         Returns pre-bucketed rx_ms/tx_ms per time bucket instead of raw packet rows,
-        reducing response size from potentially hundreds of KB to a few KB.
+        reducing response size from potentially hundreds of KB to a few KB. The
+        response carries one series per active radio under ``radios`` alongside the
+        legacy combined fields.
+
+        The server's own radio configuration decides which profile each radio's
+        airtime is computed with; a two-radio Fabric must never have one
+        caller-supplied profile applied to both sides. The ``sf``/``bw_hz``/``cr``/
+        ``preamble`` query parameters are kept only as a fallback for callers
+        talking to a configuration this server cannot read profiles from.
         """
         try:
             now = __import__("time").time()
@@ -4110,10 +4171,38 @@ class APIEndpoints:
                 bw_hz=int(bw_hz),
                 cr=int(cr),
                 preamble=int(preamble),
+                radio_profiles=self._active_radio_profiles(),
             )
             return self._success(result)
         except Exception as e:
             logger.error(f"Error getting airtime chart data: {e}")
+            return self._error(e)
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def radio_packet_rates(self, hours=24, bucket_seconds=None):
+        """Receptions and transmissions per radio per bucket, for per-radio rate charts.
+
+        A relay sent on both radios of a bridge counts as a transmission on each.
+        """
+        try:
+            window_hours = max(1, min(int(hours), 168))
+            if bucket_seconds is None:
+                bucket_s = 300 if window_hours <= 6 else 3600
+            else:
+                bucket_s = max(60, min(int(bucket_seconds), 86400))
+            end_ts = time.time()
+            result = self._get_storage().get_radio_packet_rates(
+                start_timestamp=end_ts - window_hours * 3600,
+                end_timestamp=end_ts,
+                bucket_seconds=bucket_s,
+                radio_profiles=self._active_radio_profiles(),
+            )
+            return self._success(dict(result, hours=window_hours))
+        except ValueError as e:
+            return self._error(f"Invalid parameter format: {e}")
+        except Exception as e:
+            logger.error(f"Error getting radio packet rates: {e}")
             return self._error(e)
 
     @cherrypy.expose
@@ -4371,6 +4460,7 @@ class APIEndpoints:
                 end_timestamp=end_ts,
                 bucket_seconds=bucket_s,
                 severe_attempt_threshold=severe_threshold,
+                radio_profiles=self._active_radio_profiles(),
             )
 
             rrd_data = storage.get_rrd_data(
@@ -4457,6 +4547,12 @@ class APIEndpoints:
                 ),
             }
 
+            limitations = [
+                "LBT attempts are derived from stored per-packet retry counts (lbt_attempts + 1).",
+                "Per-attempt RSSI/SNR and channel frequency are not recorded for each LBT attempt.",
+                "Airtime utilisation is not available in the current RRD metric set for direct alignment.",
+            ]
+
             diagnostics = {
                 "start_time": int(start_ts),
                 "end_time": int(end_ts),
@@ -4467,12 +4563,19 @@ class APIEndpoints:
                 "packet_types": lbt.get("packet_types", []),
                 "packet_type_buckets": merged_packet_type_buckets,
                 "correlations": correlations,
-                "limitations": [
-                    "LBT attempts are derived from stored per-packet retry counts (lbt_attempts + 1).",
-                    "Per-attempt RSSI/SNR and channel frequency are not recorded for each LBT attempt.",
-                    "Airtime utilisation is not available in the current RRD metric set for direct alignment.",
-                ],
+                "limitations": limitations,
             }
+
+            if "radios" in lbt:
+                # Per-radio buckets carry no rf block: the RRD series behind it is
+                # node-wide, so attaching it to one radio would read as that
+                # radio's own RSSI, SNR and loss.
+                diagnostics["radios"] = lbt["radios"]
+                diagnostics["unattributed_transmissions"] = lbt.get("unattributed_transmissions", 0)
+                limitations.append(
+                    "Per-radio figures count physical transmissions and carry no RF or "
+                    "packet-type breakdown; the combined figures count each packet once."
+                )
 
             return self._success(diagnostics)
 
@@ -4810,26 +4913,48 @@ class APIEndpoints:
             if "mesh" not in self.config:
                 self.config["mesh"] = {}
 
-            # Optional multi-radio target. When radios[] exists and radio_id is
-            # provided, LoRa air settings are written into that entry's radio{}
-            # instead of (or in addition to) the legacy top-level radio{}.
+            # A Fabric edit targets the named radio, or its default when the old
+            # single-radio request shape omits radio_id.
+            # A blank radio_id is the request not naming one, not a request to
+            # name the empty string. Left as-is it fell past the radios[] lookup
+            # without matching or erroring, wrote the top-level block alone, and
+            # left the default radio's own entry behind -- hardware on one
+            # bandwidth, its duty-cycle meter on another.
             target_radio_id = data.get("radio_id")
+            if isinstance(target_radio_id, str) and not target_radio_id.strip():
+                target_radio_id = None
             radios_list = self.config.get("radios")
             target_radio_cfg = self.config["radio"]
             target_entry = None
-            if isinstance(radios_list, list) and target_radio_id:
+            target_is_default = False
+            effective_target_id = target_radio_id
+            if isinstance(radios_list, list) and radios_list:
+                fabric = (
+                    self.config.get("fabric") if isinstance(self.config.get("fabric"), dict) else {}
+                )
+                default_id = fabric.get("default_radio") or fabric.get("default_radio_id")
+                if default_id is None:
+                    first = radios_list[0] if isinstance(radios_list[0], dict) else {}
+                    default_id = first.get("id") or first.get("radio_id")
+                if effective_target_id is None:
+                    effective_target_id = default_id
+
+            if isinstance(radios_list, list) and effective_target_id:
                 for entry in radios_list:
                     if not isinstance(entry, dict):
                         continue
                     rid = entry.get("id") or entry.get("radio_id")
-                    if str(rid) == str(target_radio_id):
+                    if str(rid) == str(effective_target_id):
                         target_entry = entry
                         if not isinstance(entry.get("radio"), dict):
                             entry["radio"] = {}
                         target_radio_cfg = entry["radio"]
                         break
                 if target_entry is None:
-                    return self._error(f"Unknown radio_id={target_radio_id!r}")
+                    return self._error(f"Unknown radio_id={effective_target_id!r}")
+                target_is_default = default_id is not None and str(default_id) == str(
+                    effective_target_id
+                )
 
             def _set_radio_param(key, value):
                 target_radio_cfg[key] = value
@@ -4837,21 +4962,10 @@ class APIEndpoints:
                 # radio or when no radios[] list is active.
                 if target_entry is None:
                     self.config["radio"][key] = value
-                else:
-                    default_id = None
-                    fabric = (
-                        self.config.get("fabric")
-                        if isinstance(self.config.get("fabric"), dict)
-                        else {}
-                    )
-                    default_id = fabric.get("default_radio") or fabric.get("default_radio_id")
-                    if default_id is None and radios_list:
-                        first = radios_list[0] if isinstance(radios_list[0], dict) else {}
-                        default_id = first.get("id") or first.get("radio_id")
-                    if default_id is not None and str(default_id) == str(target_radio_id):
-                        if "radio" not in self.config or not isinstance(self.config["radio"], dict):
-                            self.config["radio"] = {}
-                        self.config["radio"][key] = value
+                elif target_is_default:
+                    if "radio" not in self.config or not isinstance(self.config["radio"], dict):
+                        self.config["radio"] = {}
+                    self.config["radio"][key] = value
 
             # Update TX power (up to 30 dBm for high-power radios)
             if "tx_power" in data:
@@ -5020,8 +5134,18 @@ class APIEndpoints:
             if not applied:
                 return self._error("No valid settings provided")
 
-            live_sections = ["repeater", "delays", "radio"]
-            if target_entry is not None:
+            live_sections = ["repeater", "delays"]
+            radio_fields = {
+                "tx_power",
+                "frequency",
+                "bandwidth",
+                "spreading_factor",
+                "coding_rate",
+            }
+            radio_changed = any(field in data for field in radio_fields)
+            if radio_changed and (target_entry is None or target_is_default):
+                live_sections.append("radio")
+            elif radio_changed:
                 live_sections.append("radios")
             if "mesh" in self.config and any(k in data for k in ("path_hash_mode", "loop_detect")):
                 live_sections.append("mesh")
@@ -5061,8 +5185,16 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def noise_floor_history(self, hours: int = 24, limit: int = None, offset: int = 0):
+    def noise_floor_history(
+        self, hours: int = 24, limit: int = None, offset: int = 0, radio_id: str = None
+    ):
+        """Noise floor samples, optionally for one radio.
 
+        On a node with two or more radios each row names the radio it was read
+        from, and ``radio_id`` pages that radio's samples on their own. Paging
+        the combined series by offset is stable only when nothing is filtered
+        out, which is why the RF Health page names a radio.
+        """
         try:
             storage = self._get_storage()
             hours = int(hours)
@@ -5078,31 +5210,37 @@ class APIEndpoints:
                 hours=hours,
                 limit=normalized_limit,
                 offset=offset,
+                radio_id=radio_id or None,
+                radio_profiles=self._active_radio_profiles(),
             )
 
-            return self._success(
-                {
-                    "history": history,
-                    "hours": hours,
-                    "count": len(history),
-                    "limit": normalized_limit,
-                    "offset": offset,
-                }
-            )
+            payload = {
+                "history": history,
+                "hours": hours,
+                "count": len(history),
+                "limit": normalized_limit,
+                "offset": offset,
+            }
+            if radio_id:
+                payload["radio_id"] = radio_id
+            return self._success(payload)
         except Exception as e:
             logger.error(f"Error fetching noise floor history: {e}")
             return self._error(e)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def noise_floor_stats(self, hours: int = 24):
-
+    def noise_floor_stats(self, hours: int = 24, radio_id: str = None):
+        """Noise floor summary, for one radio when ``radio_id`` is given."""
         try:
             storage = self._get_storage()
             hours = int(hours)
-            stats = storage.get_noise_floor_stats(hours=hours)
+            stats = storage.get_noise_floor_stats(hours=hours, radio_id=radio_id or None)
 
-            return self._success({"stats": stats, "hours": hours})
+            payload = {"stats": stats, "hours": hours}
+            if radio_id:
+                payload["radio_id"] = radio_id
+            return self._success(payload)
         except Exception as e:
             logger.error(f"Error fetching noise floor stats: {e}")
             return self._error(e)
@@ -5123,27 +5261,42 @@ class APIEndpoints:
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def crc_error_count(self, hours: int = 24):
-        """Return total CRC errors within the given time window."""
+    def crc_error_count(self, hours: int = 24, radio_id: str = None):
+        """Return total CRC errors within the given time window, or for one radio."""
         try:
             storage = self._get_storage()
             hours = int(hours)
-            count = storage.get_crc_error_count(hours=hours)
-            return self._success({"crc_error_count": count, "hours": hours})
+            count = storage.get_crc_error_count(hours=hours, radio_id=radio_id or None)
+            payload = {"crc_error_count": count, "hours": hours}
+            if radio_id:
+                payload["radio_id"] = radio_id
+            return self._success(payload)
         except Exception as e:
             logger.error(f"Error fetching CRC error count: {e}")
             return self._error(e)
 
     @cherrypy.expose
     @cherrypy.tools.json_out()
-    def crc_error_history(self, hours: int = 24, limit: int = None):
-        """Return CRC error records within the given time window."""
+    def crc_error_history(self, hours: int = 24, limit: int = None, radio_id: str = None):
+        """Return CRC error records within the given time window.
+
+        On a node with two or more radios each row names the radio whose counter
+        the errors came from; ``radio_id`` narrows the series to one radio.
+        """
         try:
             storage = self._get_storage()
             hours = int(hours)
             limit = int(limit) if limit else None
-            history = storage.get_crc_error_history(hours=hours, limit=limit)
-            return self._success({"history": history, "hours": hours, "count": len(history)})
+            history = storage.get_crc_error_history(
+                hours=hours,
+                limit=limit,
+                radio_id=radio_id or None,
+                radio_profiles=self._active_radio_profiles(),
+            )
+            payload = {"history": history, "hours": hours, "count": len(history)}
+            if radio_id:
+                payload["radio_id"] = radio_id
+            return self._success(payload)
         except Exception as e:
             logger.error(f"Error fetching CRC error history: {e}")
             return self._error(e)
@@ -8348,6 +8501,52 @@ class APIEndpoints:
                 "logging",
                 "radio_type",
             }
+
+            # Structural check first, before anything is written. The loop below
+            # also rejects a non-list radios, but only once it has already
+            # merged whatever sections came before it in the request -- a
+            # failure that still changes self.config. Checking here also keeps
+            # the message about the real problem: a malformed radios section
+            # otherwise reaches the fan-out check as "one radio" and is reported
+            # as a radio-count error.
+            if "radios" in imported_config:
+                incoming_radios = imported_config["radios"]
+                if incoming_radios is not None and not isinstance(incoming_radios, list):
+                    return self._error("radios must be a list or null")
+
+            # Fabric fan-out is only checked when the radio stack is built, so
+            # an impossible combination would persist here and then refuse to
+            # start at the next restart. Check the merged result before touching
+            # self.config, mirroring exactly how the loop below merges each of
+            # these two sections.
+            if "fabric" in imported_config or "radios" in imported_config:
+                prospective = {}
+
+                if "fabric" in imported_config:
+                    incoming_fabric = imported_config["fabric"]
+                    current_fabric = self.config.get("fabric")
+                    if isinstance(incoming_fabric, dict) and isinstance(current_fabric, dict):
+                        # Dict-update merge, as the loop's else-branch performs.
+                        prospective["fabric"] = {**current_fabric, **incoming_fabric}
+                    else:
+                        # Anything else replaces the section wholesale -- including
+                        # ``fabric: null``, which wipes it. That is how an operator
+                        # clears fan-out left invalid by an older build, so
+                        # validating the old section here would reject the very
+                        # import that repairs the node.
+                        prospective["fabric"] = incoming_fabric
+                else:
+                    prospective["fabric"] = self.config.get("fabric")
+
+                if "radios" in imported_config:
+                    prospective["radios"] = imported_config["radios"]
+                else:
+                    prospective["radios"] = self.config.get("radios")
+
+                try:
+                    validate_fabric_config(prospective)
+                except ValueError as exc:
+                    return self._error(str(exc))
 
             updated_sections = []
             restart_required = False

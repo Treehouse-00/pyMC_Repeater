@@ -391,11 +391,14 @@ class RepeaterDaemon:
                 meta = getattr(self, "radio_stack_meta", {}) or {}
                 if meta.get("fabric"):
                     logger.info(
-                        "RF fabric active: mode=%s radios=%s default=%s tx_mode=%s",
+                        "RF fabric active: mode=%s radios=%s default=%s tx_mode=%s "
+                        "repeat_on_ingress=%s origin_tx=%s",
                         meta.get("mode"),
                         meta.get("radio_ids"),
                         meta.get("default_radio"),
                         meta.get("tx_mode"),
+                        meta.get("repeat_on_ingress"),
+                        meta.get("origin_tx"),
                     )
 
                 # Physical radios for per-device setup (CAD, event loop).
@@ -1579,7 +1582,10 @@ class RepeaterDaemon:
         if not self.repeater_handler:
             return {}
         engine = self.repeater_handler
-        airtime = engine.airtime_mgr.get_stats()
+        # The node's airtime, not the default radio's channel: a bridge reports
+        # the time it spent on air, however many radios it spent it on.
+        airtime_stats = getattr(engine, "airtime_stats", None)
+        airtime = airtime_stats() if callable(airtime_stats) else engine.airtime_mgr.get_stats()
         uptime_secs = int(time.time() - engine.start_time)
         queue_len = 0
         for bridge in getattr(self, "companion_bridges", {}).values():
