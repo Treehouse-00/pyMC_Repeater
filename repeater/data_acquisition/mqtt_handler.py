@@ -669,6 +669,10 @@ class MeshCoreToMqttPusher:
         self._shutdown_requested = False
         self._lock = threading.Lock()
         self._connect_timers: List[threading.Timer] = []
+        # The radio map as built when the radios were last really configured.
+        # Seeded on the first build, which is this process's start -- see
+        # _radio_map for why a later rebuild must not replace it wholesale.
+        self._applied_radio_map: Optional[dict] = None
 
         # Initialize brokers list
         mqtt_brokers_config = config.get("mqtt_brokers", {})
@@ -1048,15 +1052,24 @@ class MeshCoreToMqttPusher:
         when there is genuinely more than one band to tell apart.
 
         Rebuilt per status publish rather than cached at construction, because
-        air settings can be changed from the web UI while the node runs.
+        air settings can be changed from the web UI while the node runs. Only
+        the default radio is retuned by such a save, though, and radios[] entries
+        inherit the top-level ``radio`` block key by key -- so a rebuild that
+        took every entry from the current config would report a new bandwidth
+        for radios still transmitting on the old one, and observers would
+        attribute their packets to a band they are not on. The first build is
+        kept and handed back in as ``applied`` so every non-default radio keeps
+        what it was really configured with until the service restarts.
         """
         from ..config import build_radio_status_entries
 
         try:
-            entries = build_radio_status_entries(self.config)
+            entries = build_radio_status_entries(self.config, applied=self._applied_radio_map)
         except Exception as exc:  # pragma: no cover - reporting must not break status
             logger.debug(f"Could not build radio map for status: {exc}")
             return []
+        if self._applied_radio_map is None and entries:
+            self._applied_radio_map = {entry["id"]: entry for entry in entries}
         return entries if len(entries) > 1 else []
 
     def publish(self, subtopic: str, payload: dict, retain: bool = False, qos: int = 0):

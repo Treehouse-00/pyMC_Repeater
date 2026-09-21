@@ -1,4 +1,5 @@
 import base64
+import copy
 import inspect
 import logging
 import os
@@ -9,7 +10,11 @@ from typing import Any, Dict, Optional, overload
 import yaml
 
 from repeater.exceptions import ConfigurationError
-from repeater.modem_config import LEGACY_MODEM_RADIO_TYPES, normalize_modem_config
+from repeater.modem_config import (
+    LEGACY_MODEM_RADIO_TYPES,
+    normalize_modem_config,
+    redact_modem_tokens_in_place,
+)
 from repeater.policy_engine import default_policy_engine_config
 
 logger = logging.getLogger("Config")
@@ -762,11 +767,28 @@ def get_radio_for_board(board_config: dict):
     )
 
 
+# Keys within one section that are alternative spellings of a single setting.
+# Whole-section replacement kept these from meeting; key-by-key overlay lets an
+# inherited spelling sit next to the entry's, and downstream each pair has a
+# fixed winner -- en_pins beats en_pin in SX1262Radio, "address" beats
+# "device_address" and "serial_number" beats "serial" in get_radio_for_board.
+# So an entry naming one spelling drops the other rather than losing to a
+# default it never wrote, which would otherwise fail silently: a radio that
+# never powers up, or one opened on the wrong CH341 adapter.
+_RADIO_SECTION_ALIASES = {
+    "sx1262": (("en_pin", "en_pins"),),
+    "ch341": (("address", "device_address"), ("serial_number", "serial")),
+}
+
+
 def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
     """Build a board_config dict for one radios[] entry.
 
-    Entry may override radio_type and hardware sections; shared top-level
-    ``radio`` air settings are inherited unless the entry supplies its own.
+    Top-level radio and hardware sections act as defaults for multi-radio
+    entries. Mapping sections are overlaid key-by-key, so an entry only needs
+    to specify values that differ from the top-level configuration. Explicit
+    values, including False/None, override inherited values. ``radio_type``
+    is a scalar override.
     """
     if not isinstance(entry, dict):
         raise ValueError("each radios[] entry must be a mapping")
@@ -776,8 +798,15 @@ def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
         raise ValueError("each radios[] entry requires an 'id'")
 
     merged = dict(global_config)
+
+    # radio_type is scalar: a per-radio value replaces the global value.
+    if "radio_type" in entry:
+        merged["radio_type"] = entry["radio_type"]
+
+    # Configuration sections use shallow overlay semantics. This is
+    # intentionally one level deep: the known sections currently contain
+    # scalar values and simple lists rather than nested configuration trees.
     for key in (
-        "radio_type",
         "radio",
         "sx1262",
         "ch341",
@@ -785,8 +814,21 @@ def _merge_radio_entry(global_config: dict, entry: dict) -> dict:
         "modem_tcp",
         "modem_usb",
     ):
-        if key in entry:
-            merged[key] = entry[key]
+        if key not in entry:
+            continue
+
+        base = global_config.get(key)
+        override = entry[key]
+
+        if isinstance(base, dict) and isinstance(override, dict):
+            inherited = dict(base)
+            for group in _RADIO_SECTION_ALIASES.get(key, ()):
+                if any(alias in override for alias in group):
+                    for alias in group:
+                        inherited.pop(alias, None)
+            merged[key] = {**inherited, **override}
+        else:
+            merged[key] = override
 
     if "radio_type" not in entry and "radio_type" not in global_config:
         raise ValueError(f"radios[] entry {radio_id!r} missing radio_type")
@@ -1269,7 +1311,22 @@ def build_metering_profiles(config: dict) -> list:
     return profiles
 
 
-def build_radio_status_entries(config: dict) -> list:
+def _default_radio_id(config: dict, radio_ids: list) -> Optional[str]:
+    """The radio a live config save actually retunes.
+
+    Mirrors build_radio_stack's TX default -- ``fabric.default_radio`` when it
+    names a radio that exists, else the first configured one. A default naming
+    a radio that is not there cannot be the one that got retuned, so it falls
+    back rather than freezing every entry.
+    """
+    fabric_cfg = config.get("fabric") if isinstance(config.get("fabric"), dict) else {}
+    default_radio = fabric_cfg.get("default_radio") or fabric_cfg.get("default_radio_id")
+    if default_radio and str(default_radio) in radio_ids:
+        return str(default_radio)
+    return radio_ids[0] if radio_ids else None
+
+
+def build_radio_status_entries(config: dict, *, applied: Optional[dict] = None) -> list:
     """Map every radio id to its air settings, for the MQTT status message.
 
     Observers join this against the ``rx_radio_id`` / ``tx_radio_ids`` fields
@@ -1285,12 +1342,24 @@ def build_radio_status_entries(config: dict) -> list:
     the air settings it never voids the map: power does not decide which band a
     packet was on, so an entry without it still attributes the packet correctly.
 
-    Every value here is what the node is **configured** with, not a reading from
-    the hardware. Two consequences worth knowing before trusting a figure: a
-    driver may clamp what it was given (an SX1262 holds -9..22 dBm), and editing
-    a ``radios[]`` entry does not reconfigure that radio live -- ``config_manager``
-    only applies the top-level ``radio`` section -- so after such an edit the map
-    leads the hardware until the service restarts.
+    These are the settings each radio was actually configured with, not a
+    reading from the hardware -- a driver may still clamp what it was given (an
+    SX1262 holds -9..22 dBm).
+
+    ``applied`` maps radio id to the entry built when that radio was last really
+    configured, and makes the map survive a live save. Only the default radio is
+    retuned without a restart: a change to any other sits in ``radios[]`` marked
+    restart-required. Because ``radios[]`` entries inherit the top-level
+    ``radio`` block key by key, a save that edits the default radio also moves
+    the *configured* values of every radio whose entry omits that key, so
+    rebuilding all of them from config would publish a bandwidth the hardware
+    was never given and mis-attribute that radio's packets to a band it is not
+    on. Entries other than the default therefore keep their applied values until
+    the service restarts. ``AirtimeBudgets._effective_air`` holds the same line
+    for duty-cycle metering.
+
+    Passing no ``applied`` map rebuilds every entry from config, which is what a
+    fresh start wants.
 
     Returns an empty list when any radio's settings are unreadable: a partial
     map would silently attribute a packet to the wrong band, which is worse
@@ -1316,7 +1385,35 @@ def build_radio_status_entries(config: dict) -> list:
         if tx_power is not None:
             entry["tx_power"] = tx_power
         entries.append(entry)
+
+    if applied:
+        default_id = _default_radio_id(config, [entry["id"] for entry in entries])
+        entries = [
+            entry if entry["id"] == default_id else applied.get(entry["id"], entry)
+            for entry in entries
+        ]
     return entries
+
+
+_RADIO_LOG_SECTIONS = ("radio", "sx1262", "ch341", "kiss", "modem_tcp", "modem_usb")
+
+
+def _describe_radio_config(board_config: dict) -> str:
+    """Render a resolved board_config for debug logging, tokens redacted.
+
+    What a radio inherited is otherwise invisible: the config file shows the
+    entry, not the merge, and a wrong answer surfaces as a radio that does not
+    transmit. ``modem_tcp.token`` is the one credential these sections carry,
+    and ``redact_modem_tokens_in_place`` runs over a copy so the live config is
+    untouched.
+    """
+    snapshot = {
+        key: copy.deepcopy(board_config[key]) for key in _RADIO_LOG_SECTIONS if key in board_config
+    }
+    redact_modem_tokens_in_place(snapshot, replacement="***")
+    parts = [f"type={board_config.get('radio_type')!r}"]
+    parts.extend(f"{key}={snapshot[key]!r}" for key in _RADIO_LOG_SECTIONS if key in snapshot)
+    return " ".join(parts)
 
 
 def build_radio_stack(config: dict):
@@ -1367,6 +1464,8 @@ def build_radio_stack(config: dict):
         for entry in radios_cfg:
             merged = _merge_radio_entry(config, entry)
             rid = merged.pop("_radio_id")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Resolved radio %r: %s", rid, _describe_radio_config(merged))
             physical = get_radio_for_board(merged)
             pairs.append((physical, rid))
             profile = _radio_air_profile(merged, rid)

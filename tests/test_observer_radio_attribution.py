@@ -11,6 +11,7 @@ Single-radio nodes must publish exactly what they published before any of this
 existed.
 """
 
+import copy
 import json
 import logging
 from unittest.mock import MagicMock, patch
@@ -454,3 +455,113 @@ def test_collector_omits_radio_ids_on_a_single_radio_node(tmp_path):
 
     assert "rx_radio_id" not in payload
     assert "tx_radio_ids" not in payload
+
+
+# --------------------------------------------------------------------
+# A live save must not move a radio that was not retuned
+# --------------------------------------------------------------------
+def test_applied_map_holds_non_default_radios_across_a_live_edit():
+    """Entries inherit the top-level radio block key by key, so editing the
+    default radio changes what a partial entry is *configured* with. Only the
+    default radio is actually retuned, so the rest must keep reporting the band
+    they are still transmitting on."""
+    config = {
+        "radio_type": "sx1262",
+        "radio": {
+            "frequency": 869618000,
+            "bandwidth": 62500,
+            "spreading_factor": 8,
+            "coding_rate": 8,
+            "preamble_length": 32,
+        },
+        "fabric": {"default_radio": "local"},
+        "radios": [
+            {"id": "local", "radio": {"frequency": 869618000}},
+            # Omits bandwidth/SF/CR, so it inherits them.
+            {"id": "link", "radio": {"frequency": 864200000}},
+        ],
+    }
+
+    applied = {entry["id"]: entry for entry in build_radio_status_entries(config)}
+    assert applied["link"]["radio"] == "864.2,62.5,8,8"
+
+    # What api_endpoints._set_radio_param does for the default radio: write the
+    # target entry, and mirror it into the legacy top-level block.
+    config["radios"][0]["radio"]["bandwidth"] = 500000
+    config["radio"]["bandwidth"] = 500000
+
+    entries = build_radio_status_entries(config, applied=applied)
+    by_id = {entry["id"]: entry for entry in entries}
+
+    assert by_id["local"]["radio"] == "869.618,500.0,8,8"  # really retuned
+    assert by_id["link"]["radio"] == "864.2,62.5,8,8"  # still on 62.5 kHz
+
+    # Without the applied map, link would follow the mirrored top-level value
+    # onto a band its hardware was never given -- the bug this guards.
+    naive = {e["id"]: e["radio"] for e in build_radio_status_entries(config)}
+    assert naive["link"] == "864.2,500.0,8,8"
+
+
+def test_applied_map_is_ignored_for_a_radio_the_config_has_just_added():
+    """A radio with no applied entry has no band to preserve, so it reports
+    what it is configured with."""
+    config = {
+        "radio_type": "sx1262",
+        "radio": LOCAL_RADIO["radio"],
+        "fabric": {"default_radio": "local"},
+        "radios": [LOCAL_RADIO, LINK_RADIO],
+    }
+    applied = {"local": {"id": "local", "radio": "869.618,62.5,8,8"}}
+
+    entries = build_radio_status_entries(config, applied=applied)
+
+    assert entries[1] == {"id": "link", "radio": "864.2,62.5,11,8"}
+
+
+def test_no_applied_map_rebuilds_every_entry_from_config():
+    """A fresh start has nothing to preserve."""
+    config = {"radios": [LOCAL_RADIO, LINK_RADIO], "fabric": {"default_radio": "local"}}
+
+    assert build_radio_status_entries(config) == build_radio_status_entries(config, applied=None)
+
+
+def _publish_status_across_a_live_edit(config: dict, mutate) -> tuple:
+    """Two status publishes from one pusher, with a config edit between them."""
+    pusher = MeshCoreToMqttPusher(local_identity=_FakeIdentity("AB" * 32), config=config)
+    conn = pusher.connections[0]
+    captured = []
+    conn._running = True
+    conn.client = MagicMock()
+    conn.client.publish = lambda topic, payload, retain=False, qos=0: captured.append(payload)
+
+    pusher.publish_status(state="online")
+    mutate(config)
+    pusher.publish_status(state="online")
+
+    assert len(captured) == 2
+    return tuple(json.loads(payload) for payload in captured)
+
+
+def test_published_status_holds_a_non_retuned_radio_across_a_live_edit():
+    """The handler-level version of the same guarantee: an observer must not be
+    told a radio moved band when only the default radio was retuned."""
+    local = copy.deepcopy(LOCAL_RADIO)
+    config = _make_config(radios=[local, {"id": "link", "radio": {"frequency": 864200000}}])
+    config["radio"] = copy.deepcopy(LOCAL_RADIO["radio"])
+    config["fabric"]["default_radio"] = "local"
+
+    def widen_the_default_radio(cfg):
+        # Mirrors api_endpoints._set_radio_param for the default radio.
+        cfg["radios"][0]["radio"]["bandwidth"] = 500000
+        cfg["radio"]["bandwidth"] = 500000
+
+    first, second = _publish_status_across_a_live_edit(config, widen_the_default_radio)
+
+    assert {e["id"]: e["radio"] for e in first["radios"]} == {
+        "local": "869.618,62.5,8,8",
+        "link": "864.2,62.5,8,8",
+    }
+    assert {e["id"]: e["radio"] for e in second["radios"]} == {
+        "local": "869.618,500.0,8,8",  # retuned
+        "link": "864.2,62.5,8,8",  # untouched, still reported as it is
+    }
