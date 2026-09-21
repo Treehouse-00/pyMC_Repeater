@@ -198,14 +198,18 @@ class StorageCollector:
         # a bridge's stored history covers every radio it transmits on.
         airtime_stats = _node_airtime_stats(self.repeater_handler) or {}
 
-        # Get latest noise floor from database
+        # The default radio's last reading, from memory rather than the newest
+        # row in the table. Every radio's sample is stored now and the default is
+        # sampled first, so the newest row on a Fabric node is the *other*
+        # radio's -- the opposite of the figure a status message reports. The
+        # engine holds the default radio's reading, which is what /stats reads.
         noise_floor = None
-        try:
-            recent_noise = self.sqlite_handler.get_noise_floor_history(hours=0.5, limit=1)
-            if recent_noise and len(recent_noise) > 0:
-                noise_floor = recent_noise[-1].get("noise_floor_dbm")
-        except Exception as e:
-            logger.debug(f"Could not fetch noise floor: {e}")
+        cached_noise_floor = getattr(self.repeater_handler, "get_cached_noise_floor", None)
+        if callable(cached_noise_floor):
+            try:
+                noise_floor = cached_noise_floor()
+            except Exception as e:
+                logger.debug(f"Could not read cached noise floor: {e}")
 
         stats = {
             "uptime_secs": uptime_secs,
