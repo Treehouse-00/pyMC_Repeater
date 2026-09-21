@@ -117,6 +117,36 @@ def test_no_disallowed_list_publishes_every_type():
     assert len(captured) == 2
 
 
+def test_a_filtered_broker_is_not_reported_as_an_absent_connection():
+    """A deliberate filter is not a broker outage.
+
+    An empty results list is how publish() decides nothing was reachable, so
+    skipping a filtered connection without recording it made a healthy node warn
+    "No active broker connections" for every packet of a type someone chose to
+    filter -- loudest for exactly the common types people filter.
+    """
+    pusher, captured = _capturing_pusher(_make_config(disallowed=["ADVERT"]))
+
+    with patch("repeater.data_acquisition.mqtt_handler.logger") as log:
+        results = pusher.publish_packet(_packet_payload(ADVERT))
+
+    assert captured == []
+    assert results
+    assert [call for call in log.warning.call_args_list] == []
+
+
+def test_a_genuinely_absent_connection_still_warns():
+    """The warning has to keep working, or the fix trades one silence for another."""
+    pusher, _ = _capturing_pusher(_make_config())
+    pusher.connections[0]._running = False
+
+    with patch("repeater.data_acquisition.mqtt_handler.logger") as log:
+        results = pusher.publish_packet(_packet_payload(TXT_MSG))
+
+    assert results == []
+    assert log.warning.called
+
+
 def test_status_is_never_filtered_by_the_packet_type_list():
     """Status carries no packet type; a filtered broker must still get it."""
     pusher, captured = _capturing_pusher(_make_config(disallowed=["ADVERT"]))

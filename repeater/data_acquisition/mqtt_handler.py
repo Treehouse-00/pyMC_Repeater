@@ -1076,6 +1076,19 @@ class MeshCoreToMqttPusher:
                 if conn.enabled and conn.is_connected():
                     if packet_type is not None and packet_type in conn.disallowed_types:
                         _trace(f"Skipped publishing packet type 0x{packet_type:02X} (disallowed)")
+                        # Record the deliberate skip. The warning below reads an
+                        # empty results list as "no broker was reachable", so a
+                        # bare continue made a node whose brokers all filter this
+                        # type warn about its connections on every such packet --
+                        # loudest for exactly the common type someone chose to
+                        # filter. publish_mqtt already records its own intentional
+                        # skips for this reason.
+                        results.append(
+                            (
+                                conn.broker["name"],
+                                f"Skipped: packet type 0x{packet_type:02X} disallowed",
+                            )
+                        )
                         continue
                     result = conn.publish(subtopic, message, retain=retain, qos=qos)
                     results.append((conn.broker["name"], result))
