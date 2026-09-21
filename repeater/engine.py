@@ -2144,6 +2144,14 @@ class RepeaterHandler(BaseHandler):
         """
         return self.airtime_budgets.node_stats()
 
+    def airtime_stats_by_radio(self) -> list:
+        """``[{radio_id, ...}]`` per radio, empty on a single-radio node.
+
+        Radios sharing a channel report the same figures because they are the
+        same budget, which is the statement rather than a duplication.
+        """
+        return self.airtime_budgets.per_radio_stats()
+
     def _egress_can_transmit(
         self, packet: Packet, tx_radio_ids: Optional[Tuple[str, ...]]
     ) -> Tuple[bool, float]:
@@ -2465,6 +2473,21 @@ class RepeaterHandler(BaseHandler):
         """
         radio = self.dispatcher.radio if self.dispatcher else None
         return int(getattr(radio, "crc_error_count", 0) or 0) if radio else 0
+
+    def get_crc_error_count_by_radio(self) -> Dict[str, int]:
+        """Each radio's cumulative CRC error count. Empty on a single-radio node.
+
+        Read from the hardware counters rather than the sampler's baselines, so
+        a status message is not pinned to whenever the CRC tick last ran. A
+        radio the fabric cannot hand back is omitted rather than reported as
+        zero: absent and error-free are not the same claim.
+        """
+        counts = {}
+        for radio_id, radio in self._sampling_radios():
+            if radio_id is None or radio is None:
+                continue
+            counts[radio_id] = int(getattr(radio, "crc_error_count", 0) or 0)
+        return counts
 
     def get_stats(self) -> dict:
         runtime_config = normalize_modem_config(self.config, warn=False)

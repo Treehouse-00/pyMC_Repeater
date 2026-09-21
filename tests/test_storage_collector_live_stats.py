@@ -3,8 +3,9 @@
 ``_get_live_stats`` is what a LetsMesh-style observer reads on every heartbeat,
 so the figures it reports have to be the node's own: both directions of airtime,
 the default radio's noise floor rather than whichever radio sampled last, and a
-receive-error count rather than a literal zero. The last test covers the other
-half of that -- publish_status must let those figures through.
+receive-error count rather than a literal zero. The last tests cover the other
+half of that -- publish_status must let those figures through, and on a bridge
+each radio must report its own beside the node's.
 """
 
 import json
@@ -165,7 +166,31 @@ class _FakeIdentity:
         return self._pk
 
 
-def _publish_status(stats_provider) -> dict:
+LOCAL_RADIO = {
+    "id": "local",
+    "radio_type": "sx1262",
+    "radio": {
+        "frequency": 869618000,
+        "bandwidth": 62500,
+        "spreading_factor": 8,
+        "coding_rate": 8,
+        "preamble_length": 32,
+    },
+}
+LINK_RADIO = {
+    "id": "link",
+    "radio_type": "sx1262",
+    "radio": {
+        "frequency": 864200000,
+        "bandwidth": 62500,
+        "spreading_factor": 11,
+        "coding_rate": 8,
+        "preamble_length": 32,
+    },
+}
+
+
+def _publish_status(stats_provider, radios=None, radio_stats_provider=None) -> dict:
     config = {
         "repeater": {"node_name": "test-node", "mode": "forward"},
         "radio": {
@@ -191,10 +216,14 @@ def _publish_status(stats_provider) -> dict:
             ],
         },
     }
+    if radios:
+        config["radios"] = radios
+        config["fabric"] = {"tx_mode": "bridge", "default_radio": "local"}
     pusher = MeshCoreToMqttPusher(
         local_identity=_FakeIdentity("AB" * 32),
         config=config,
         stats_provider=stats_provider,
+        radio_stats_provider=radio_stats_provider,
     )
     conn = pusher.connections[0]
     captured = []
@@ -222,3 +251,160 @@ def test_publish_status_still_defaults_the_fields_a_provider_omits():
 
     assert status["stats"]["errors"] == 0
     assert status["stats"]["queue_len"] == 0
+
+
+PER_RADIO_AIRTIME = [
+    {
+        "radio_id": "local",
+        "current_airtime_ms": 388.0,
+        "max_airtime_ms": 3600,
+        "utilization_percent": 10.8,
+        "total_airtime_ms": 2_947_200.0,
+        "total_rx_airtime_ms": 8_610_400.0,
+    },
+    {
+        "radio_id": "link",
+        "current_airtime_ms": 24.0,
+        "max_airtime_ms": 3600,
+        "utilization_percent": 0.7,
+        "total_airtime_ms": 235_400.0,
+        "total_rx_airtime_ms": 433_700.0,
+    },
+]
+
+
+def _bridge_handler(**overrides) -> SimpleNamespace:
+    per_radio = {
+        "airtime_stats_by_radio": lambda: PER_RADIO_AIRTIME,
+        "get_cached_noise_floor_by_radio": lambda: {"local": -118.5, "link": -126.0},
+        "get_crc_error_count_by_radio": lambda: {"local": 2401, "link": 82},
+    }
+    return _handler(**{**per_radio, **overrides})
+
+
+def test_radio_stats_carry_each_radios_own_figures():
+    collector = _make_collector()
+    collector.repeater_handler = _bridge_handler()
+
+    assert collector._get_radio_stats() == {
+        "local": {
+            "tx_air_secs": 2947,
+            "rx_air_secs": 8610,
+            "current_airtime_ms": 388.0,
+            "utilization_percent": 10.8,
+            "noise_floor": -118.5,
+            "errors": 2401,
+        },
+        "link": {
+            "tx_air_secs": 235,
+            "rx_air_secs": 433,
+            "current_airtime_ms": 24.0,
+            "utilization_percent": 0.7,
+            "noise_floor": -126.0,
+            "errors": 82,
+        },
+    }
+
+
+def test_radio_stats_are_empty_on_a_single_radio_node():
+    # Every figure in ``stats`` already describes that one radio.
+    collector = _make_collector()
+    collector.repeater_handler = _handler()
+
+    assert collector._get_radio_stats() == {}
+
+
+def test_radio_stats_report_the_sources_a_node_does_have():
+    # A radio the fabric cannot hand back has no CRC count, which must not cost
+    # the radios that do have one their airtime and noise floor.
+    collector = _make_collector()
+    collector.repeater_handler = _bridge_handler(
+        get_crc_error_count_by_radio=lambda: {"local": 2401}
+    )
+
+    radios = collector._get_radio_stats()
+
+    assert radios["local"]["errors"] == 2401
+    assert "errors" not in radios["link"]
+    assert radios["link"]["tx_air_secs"] == 235
+    assert radios["link"]["noise_floor"] == -126.0
+
+
+def test_one_unreadable_source_does_not_cost_the_others():
+    def boom():
+        raise RuntimeError("fabric went away")
+
+    collector = _make_collector()
+    collector.repeater_handler = _bridge_handler(get_cached_noise_floor_by_radio=boom)
+
+    radios = collector._get_radio_stats()
+
+    assert "noise_floor" not in radios["local"]
+    assert radios["local"]["tx_air_secs"] == 2947
+    assert radios["local"]["errors"] == 2401
+
+
+def test_status_radio_map_carries_telemetry_beside_the_air_settings():
+    status = _publish_status(
+        lambda: {"uptime_secs": 9},
+        radios=[LOCAL_RADIO, LINK_RADIO],
+        radio_stats_provider=lambda: {
+            "local": {"tx_air_secs": 2947, "noise_floor": -118.5, "errors": 2401},
+            "link": {"tx_air_secs": 235, "noise_floor": -126.0, "errors": 82},
+        },
+    )
+
+    assert status["radios"] == [
+        {
+            "id": "local",
+            "radio": "869.618,62.5,8,8",
+            "tx_air_secs": 2947,
+            "noise_floor": -118.5,
+            "errors": 2401,
+        },
+        {
+            "id": "link",
+            "radio": "864.2,62.5,11,8",
+            "tx_air_secs": 235,
+            "noise_floor": -126.0,
+            "errors": 82,
+        },
+    ]
+
+
+def test_a_radio_with_no_telemetry_still_attributes_its_packets():
+    # The map's first job is saying which band an id is. Telemetry is merged in,
+    # never a precondition for the entry.
+    status = _publish_status(
+        lambda: {"uptime_secs": 9},
+        radios=[LOCAL_RADIO, LINK_RADIO],
+        radio_stats_provider=lambda: {"local": {"errors": 2401}},
+    )
+
+    assert status["radios"] == [
+        {"id": "local", "radio": "869.618,62.5,8,8", "errors": 2401},
+        {"id": "link", "radio": "864.2,62.5,11,8"},
+    ]
+
+
+def test_an_unreadable_provider_leaves_the_map_intact():
+    def boom():
+        raise RuntimeError("no handler")
+
+    status = _publish_status(
+        lambda: {"uptime_secs": 9}, radios=[LOCAL_RADIO, LINK_RADIO], radio_stats_provider=boom
+    )
+
+    assert status["radios"] == [
+        {"id": "local", "radio": "869.618,62.5,8,8"},
+        {"id": "link", "radio": "864.2,62.5,11,8"},
+    ]
+
+
+def test_a_single_radio_node_publishes_no_radio_map():
+    status = _publish_status(
+        lambda: {"uptime_secs": 9},
+        radio_stats_provider=lambda: {"local": {"errors": 2401}},
+    )
+
+    assert "radios" not in status

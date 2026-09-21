@@ -98,6 +98,7 @@ class StorageCollector:
                     local_identity=local_identity,
                     config=config,
                     stats_provider=self._get_live_stats,
+                    radio_stats_provider=self._get_radio_stats,
                 )
                 self.mqtt_handler.connect()
 
@@ -243,6 +244,67 @@ class StorageCollector:
             stats["noise_floor"] = noise_floor
 
         return stats
+
+    def _get_radio_stats(self) -> dict:
+        """``{radio_id: {...}}`` for the status message's radio map.
+
+        Empty on a single-radio node, whose one radio is already what every
+        figure in ``stats`` describes. On a bridge the node-wide figures cannot
+        say which side is carrying the traffic or which side has gone deaf, so
+        each radio reports its own, under the same field names ``stats`` uses.
+
+        Each source contributes independently: a radio with a noise floor but no
+        airtime budget still reports the noise floor. Airtime is whole seconds
+        here too, matching the node-level counters.
+        """
+        if not self.repeater_handler:
+            return {}
+
+        radios: dict = {}
+
+        def entry(radio_id) -> dict:
+            return radios.setdefault(str(radio_id), {})
+
+        for source, apply_to in (
+            ("airtime_stats_by_radio", self._apply_radio_airtime),
+            ("get_cached_noise_floor_by_radio", self._apply_radio_noise_floor),
+            ("get_crc_error_count_by_radio", self._apply_radio_errors),
+        ):
+            getter = getattr(self.repeater_handler, source, None)
+            if not callable(getter):
+                continue
+            try:
+                apply_to(getter(), entry)
+            except Exception as e:
+                logger.debug(f"Could not read {source} for the status radio map: {e}")
+
+        return radios
+
+    @staticmethod
+    def _apply_radio_airtime(per_radio: list, entry) -> None:
+        for radio in per_radio or []:
+            radio_id = radio.get("radio_id")
+            if radio_id is None:
+                continue
+            entry(radio_id).update(
+                {
+                    "tx_air_secs": int(radio.get("total_airtime_ms", 0) / 1000),
+                    "rx_air_secs": int(radio.get("total_rx_airtime_ms", 0) / 1000),
+                    "current_airtime_ms": radio.get("current_airtime_ms", 0),
+                    "utilization_percent": radio.get("utilization_percent", 0),
+                }
+            )
+
+    @staticmethod
+    def _apply_radio_noise_floor(by_radio: dict, entry) -> None:
+        for radio_id, noise_floor_dbm in (by_radio or {}).items():
+            if noise_floor_dbm is not None:
+                entry(radio_id)["noise_floor"] = noise_floor_dbm
+
+    @staticmethod
+    def _apply_radio_errors(by_radio: dict, entry) -> None:
+        for radio_id, count in (by_radio or {}).items():
+            entry(radio_id)["errors"] = int(count)
 
     def record_packet(
         self,
