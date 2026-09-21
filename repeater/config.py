@@ -1312,12 +1312,19 @@ def build_metering_profiles(config: dict) -> list:
 
 
 def _default_radio_id(config: dict, radio_ids: list) -> Optional[str]:
-    """The radio a live config save actually retunes.
+    """The radio a live config save retunes, read from a config mapping.
 
-    Mirrors build_radio_stack's TX default -- ``fabric.default_radio`` when it
-    names a radio that exists, else the first configured one. A default naming
-    a radio that is not there cannot be the one that got retuned, so it falls
-    back rather than freezing every entry.
+    Follows build_radio_stack's TX default -- ``fabric.default_radio``, else the
+    first configured radio -- with one deliberate difference: a default naming a
+    radio that is not in ``radio_ids`` falls back to the first instead of being
+    returned as-is. build_radio_stack hands an unknown id straight to FabricRadio
+    and the node fails to start, so that config never reaches a status publish;
+    here the fallback only has to avoid freezing every entry.
+
+    Callers reporting on a *running* node should capture this at boot rather
+    than recompute it: ``fabric.default_radio`` is restart-required, so a live
+    edit changes this answer while the running Fabric keeps its original
+    default. See ``capture_radio_status_baseline``.
     """
     fabric_cfg = config.get("fabric") if isinstance(config.get("fabric"), dict) else {}
     default_radio = fabric_cfg.get("default_radio") or fabric_cfg.get("default_radio_id")
@@ -1326,7 +1333,35 @@ def _default_radio_id(config: dict, radio_ids: list) -> Optional[str]:
     return radio_ids[0] if radio_ids else None
 
 
-def build_radio_status_entries(config: dict, *, applied: Optional[dict] = None) -> list:
+def capture_radio_status_baseline(config: dict) -> tuple:
+    """The radio map and default radio id as built, for a reporter to hold.
+
+    Call this once, from boot config, before anything can edit it. Returns
+    ``(applied, default_radio_id)`` to hand back to
+    ``build_radio_status_entries`` on every later build.
+
+    Both halves have to be captured together and early. The map is what
+    non-default radios keep until they are really reconfigured, and the default
+    id is which entry is allowed to move -- and that id is itself restart-required,
+    so reading it from live config would let a pending ``fabric.default_radio``
+    edit refresh the radio that was not retuned while freezing the one that was,
+    reporting both radios wrongly where rebuilding everything got one right.
+
+    Returns ``({}, None)`` if the config cannot be read, which leaves the caller
+    rebuilding from config exactly as it did before.
+    """
+    try:
+        entries = build_radio_status_entries(config)
+    except Exception as exc:  # pragma: no cover - reporting must not break startup
+        logger.debug("Could not capture the radio status baseline: %s", exc)
+        return {}, None
+    applied = {entry["id"]: entry for entry in entries}
+    return applied, _default_radio_id(config, list(applied))
+
+
+def build_radio_status_entries(
+    config: dict, *, applied: Optional[dict] = None, default_radio_id: Optional[str] = None
+) -> list:
     """Map every radio id to its air settings, for the MQTT status message.
 
     Observers join this against the ``rx_radio_id`` / ``tx_radio_ids`` fields
@@ -1347,9 +1382,12 @@ def build_radio_status_entries(config: dict, *, applied: Optional[dict] = None) 
     SX1262 holds -9..22 dBm).
 
     ``applied`` maps radio id to the entry built when that radio was last really
-    configured, and makes the map survive a live save. Only the default radio is
-    retuned without a restart: a change to any other sits in ``radios[]`` marked
-    restart-required. Because ``radios[]`` entries inherit the top-level
+    configured, and ``default_radio_id`` says which entry a live save is allowed
+    to move. Both come from ``capture_radio_status_baseline`` at boot; passing
+    ``applied`` without ``default_radio_id`` falls back to reading the default
+    from ``config``, which is only right if nothing has edited it yet. Only the
+    default radio is retuned without a restart: a change to any other sits in
+    ``radios[]`` marked restart-required. Because ``radios[]`` entries inherit the top-level
     ``radio`` block key by key, a save that edits the default radio also moves
     the *configured* values of every radio whose entry omits that key, so
     rebuilding all of them from config would publish a bandwidth the hardware
@@ -1387,7 +1425,9 @@ def build_radio_status_entries(config: dict, *, applied: Optional[dict] = None) 
         entries.append(entry)
 
     if applied:
-        default_id = _default_radio_id(config, [entry["id"] for entry in entries])
+        default_id = default_radio_id
+        if default_id is None:
+            default_id = _default_radio_id(config, [entry["id"] for entry in entries])
         entries = [
             entry if entry["id"] == default_id else applied.get(entry["id"], entry)
             for entry in entries

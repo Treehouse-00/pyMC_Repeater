@@ -669,10 +669,16 @@ class MeshCoreToMqttPusher:
         self._shutdown_requested = False
         self._lock = threading.Lock()
         self._connect_timers: List[threading.Timer] = []
-        # The radio map as built when the radios were last really configured.
-        # Seeded on the first build, which is this process's start -- see
-        # _radio_map for why a later rebuild must not replace it wholesale.
-        self._applied_radio_map: Optional[dict] = None
+        # The radio map and default radio id as the daemon built them, captured
+        # here rather than on the first publish: that publish waits for a broker
+        # to connect, and a node whose MQTT is briefly unreachable can take a
+        # live radio save first, which would bake the pending settings in as
+        # though they were what the hardware got. See _radio_map.
+        from ..config import capture_radio_status_baseline
+
+        self._applied_radio_map, self._applied_default_radio_id = capture_radio_status_baseline(
+            config
+        )
 
         # Initialize brokers list
         mqtt_brokers_config = config.get("mqtt_brokers", {})
@@ -1051,25 +1057,32 @@ class MeshCoreToMqttPusher:
         ``radio`` field already says everything, so the map is published only
         when there is genuinely more than one band to tell apart.
 
-        Rebuilt per status publish rather than cached at construction, because
-        air settings can be changed from the web UI while the node runs. Only
-        the default radio is retuned by such a save, though, and radios[] entries
+        Rebuilt per status publish rather than cached whole, because the default
+        radio's air settings can be changed from the web UI while the node runs.
+        Only that radio is retuned by such a save, though, and radios[] entries
         inherit the top-level ``radio`` block key by key -- so a rebuild that
         took every entry from the current config would report a new bandwidth
         for radios still transmitting on the old one, and observers would
-        attribute their packets to a band they are not on. The first build is
-        kept and handed back in as ``applied`` so every non-default radio keeps
-        what it was really configured with until the service restarts.
+        attribute their packets to a band they are not on. The baseline captured
+        at construction is handed back in, so every non-default radio keeps what
+        it was really configured with until the service restarts.
+
+        The default radio id comes from that same baseline. ``fabric.default_radio``
+        is itself restart-required, so reading it from the live config would let
+        a pending change refresh the radio that was not retuned and freeze the
+        one that was.
         """
         from ..config import build_radio_status_entries
 
         try:
-            entries = build_radio_status_entries(self.config, applied=self._applied_radio_map)
+            entries = build_radio_status_entries(
+                self.config,
+                applied=self._applied_radio_map,
+                default_radio_id=self._applied_default_radio_id,
+            )
         except Exception as exc:  # pragma: no cover - reporting must not break status
             logger.debug(f"Could not build radio map for status: {exc}")
             return []
-        if self._applied_radio_map is None and entries:
-            self._applied_radio_map = {entry["id"]: entry for entry in entries}
         return entries if len(entries) > 1 else []
 
     def publish(self, subtopic: str, payload: dict, retain: bool = False, qos: int = 0):
