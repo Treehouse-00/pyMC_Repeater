@@ -361,6 +361,57 @@ def test_protocol_request_handle_get_status_builds_56_byte_payload():
     assert len(data) == 56
 
 
+def _status_recv_errors(engine, radio) -> int:
+    """n_recv_errors, the last uint32 of the 56-byte RepeaterStats."""
+    helper = ProtocolRequestHelper(
+        identity_manager=MagicMock(),
+        packet_injector=AsyncMock(),
+        radio=radio,
+        engine=engine,
+    )
+    data = helper._handle_get_status(client=None, timestamp=0, req_data=b"")
+    return struct.unpack("<I", bytes(data[-4:]))[0]
+
+
+def _status_engine(**overrides) -> SimpleNamespace:
+    engine = SimpleNamespace(
+        start_time=time.time() - 120,
+        rx_count=7,
+        forwarded_count=5,
+        sent_flood_count=2,
+        sent_direct_count=3,
+        recv_flood_count=4,
+        recv_direct_count=1,
+        direct_dup_count=6,
+        flood_dup_count=8,
+        airtime_mgr=SimpleNamespace(total_airtime_ms=9300, total_rx_airtime_ms=4200),
+    )
+    for key, value in overrides.items():
+        setattr(engine, key, value)
+    return engine
+
+
+def _status_radio(crc_error_count=11) -> SimpleNamespace:
+    return SimpleNamespace(
+        get_noise_floor=lambda: -110,
+        get_last_rssi=lambda: -70,
+        get_last_snr=lambda: 2.5,
+        crc_error_count=crc_error_count,
+    )
+
+
+def test_status_recv_errors_counts_the_whole_node():
+    # Reading self.radio answers for the default endpoint only, so a bridge's
+    # deaf backhaul never reached a client asking for status.
+    engine = _status_engine(get_crc_error_count=lambda: 13)
+
+    assert _status_recv_errors(engine, _status_radio(crc_error_count=4)) == 13
+
+
+def test_status_recv_errors_falls_back_to_the_radio_counter():
+    assert _status_recv_errors(_status_engine(), _status_radio(crc_error_count=11)) == 11
+
+
 def test_protocol_request_access_list_admin_and_reserved_rules():
     admin = SimpleNamespace(is_admin=lambda: True)
     not_admin = SimpleNamespace(is_admin=lambda: False)

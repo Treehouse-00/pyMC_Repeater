@@ -139,7 +139,7 @@ def test_noise_floor_is_omitted_when_the_handler_cannot_report_one():
     assert "noise_floor" not in collector._get_live_stats()
 
 
-def test_errors_reports_the_radios_crc_failures():
+def test_errors_reports_the_nodes_crc_failures():
     # Published as a literal 0 for as long as the field existed, which made a
     # deaf node look like a quiet one.
     collector = _make_collector()
@@ -408,3 +408,19 @@ def test_a_single_radio_node_publishes_no_radio_map():
     )
 
     assert "radios" not in status
+
+
+def test_status_errors_reconcile_with_the_per_radio_counts():
+    # The node scalar is the sum over its radios, so a consumer can add up
+    # radios[].errors and land on stats.errors rather than on a mismatch.
+    collector = _make_collector()
+    collector.repeater_handler = _bridge_handler(get_crc_error_count=lambda: 2483)
+
+    status = _publish_status(
+        collector._get_live_stats,
+        radios=[LOCAL_RADIO, LINK_RADIO],
+        radio_stats_provider=collector._get_radio_stats,
+    )
+
+    assert status["stats"]["errors"] == 2483
+    assert sum(radio["errors"] for radio in status["radios"]) == 2483

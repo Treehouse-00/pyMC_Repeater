@@ -2463,14 +2463,34 @@ class RepeaterHandler(BaseHandler):
         return dict(self._cached_noise_floor_by_radio)
 
     def get_crc_error_count(self) -> int:
-        """The default radio's cumulative CRC error count, straight from hardware.
+        """The node's cumulative CRC error count, summed over its radios.
 
-        The default radio's, not the node's sum, because this is the figure the
-        MeshCore wire response already reports as ``n_recv_errors`` and /stats
-        as ``crc_error_count``. Per-radio counts are stored and queryable from
-        the crc_errors table; what a single scalar means here has to match what
-        the other readers of it mean.
+        The node's, not the default radio's: on a bridge the default radio is
+        one of two receivers, and reporting only its errors leaves a deaf
+        backhaul invisible in every scalar the node publishes. Summing matches
+        what AirtimeBudgets.node_stats does with the airtime counters beside it.
+
+        Every reader of this figure sees the same number -- the MQTT status
+        message's ``stats.errors``, /stats' ``crc_error_count`` and the MeshCore
+        wire response's ``n_recv_errors`` -- so the sum of ``radios[].errors``
+        in a status message reconciles with the scalar. Which radio contributed
+        what stays available per radio, both there and in the crc_errors table.
         """
+        # Live counts win; a radio the fabric cannot hand back right now falls
+        # back to the last count the sampler read from it. These are lifetime
+        # counters, so dropping a radio from the sum would walk the node's total
+        # backwards and hand an observer reading deltas a negative interval --
+        # the same reason AirtimeBudgets keeps its retired channels' totals.
+        counts = {
+            radio_id: count
+            for radio_id, count in self._crc_error_baselines.items()
+            if radio_id is not None
+        }
+        counts.update(self.get_crc_error_count_by_radio())
+        if counts:
+            return sum(counts.values())
+
+        # Single-radio node: one unlabelled counter, read live.
         radio = self.dispatcher.radio if self.dispatcher else None
         return int(getattr(radio, "crc_error_count", 0) or 0) if radio else 0
 

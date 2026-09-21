@@ -212,10 +212,10 @@ class StorageCollector:
             except Exception as e:
                 logger.debug(f"Could not read cached noise floor: {e}")
 
-        # Receive errors: the radio's CRC failure counter, which is the only
-        # error the node actually counts. It was published as a literal 0 for as
-        # long as the field has existed, so an observer could not tell a quiet
-        # node from a deaf one.
+        # Receive errors: CRC failures, the only error the node actually counts,
+        # summed over its radios so this reconciles with radios[].errors below.
+        # It was published as a literal 0 for as long as the field has existed,
+        # so an observer could not tell a quiet node from a deaf one.
         errors = 0
         crc_error_count = getattr(self.repeater_handler, "get_crc_error_count", None)
         if callable(crc_error_count):
