@@ -140,6 +140,52 @@ class BaselineCrcCounterRadio:
             return 0
 
 
+def disconnected_modems(config: dict, radio) -> list[str]:
+    """Return configured USB/TCP modem labels whose live transport is down.
+
+    Core's TCP modem can begin in deferred-connect mode (begin() returns True),
+    so initialization status alone cannot report connectivity. Do not probe the
+    modem here: stats and WebSocket beats must stay cheap and non-invasive.
+    """
+    root = getattr(radio, "_radio", radio)
+    fabric = getattr(root, "fabric", None)
+    radios = getattr(fabric, "radios", None)
+    entries = config.get("radios")
+    if isinstance(entries, list) and entries:
+        configured = [
+            (str(e.get("id") or e.get("radio_id") or ""), e) for e in entries if isinstance(e, dict)
+        ]
+        physicals = radios if isinstance(radios, dict) else {}
+    else:
+        configured = [("", config)]
+        physicals = {
+            "": next(iter(radios.values())) if isinstance(radios, dict) and radios else root
+        }
+
+    down = []
+    for radio_id, entry in configured:
+        kind = entry.get("radio_type", config.get("radio_type"))
+        if kind == "pymc_tcp":
+            kind = "modem_tcp"
+        elif kind == "pymc_usb":
+            kind = "modem_usb"
+        if kind not in ("modem_tcp", "modem_usb"):
+            continue
+        device = physicals.get(radio_id, root if isinstance(root, NullRadio) else None)
+        device = getattr(device, "_radio", device)
+        if isinstance(device, NullRadio):
+            connected = False
+        elif kind == "modem_tcp":
+            sock = getattr(device, "_sock", ...)
+            connected = sock is not None if sock is not ... else None
+        else:
+            event = getattr(device, "_connected_event", None)
+            connected = event.is_set() if event is not None else None
+        if connected is False:
+            down.append(f"{radio_id}: {kind}" if radio_id else kind)
+    return down
+
+
 def resolve_storage_dir(
     config: Dict[str, Any],
     *,
@@ -750,7 +796,8 @@ def get_radio_for_board(board_config: dict):
         )
 
         try:
-            radio.begin()
+            if radio.begin() is False:
+                raise RuntimeError("USB modem did not connect or accept radio configuration")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize modem_usb radio: {e}") from e
 

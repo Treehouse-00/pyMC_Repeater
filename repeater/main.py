@@ -25,6 +25,7 @@ from repeater.companion.utils import (
 from repeater.config import (
     NullRadio,
     build_radio_stack,
+    disconnected_modems,
     load_config,
     resolve_storage_dir,
     save_config,
@@ -600,6 +601,9 @@ class RepeaterDaemon:
             if self.repeater_handler and self.repeater_handler.storage:
                 self.repeater_handler.storage.advert_stats_getter = (
                     self.advert_helper.get_rate_limit_stats
+                )
+                self.repeater_handler.storage.modem_status_getter = lambda: disconnected_modems(
+                    self.config, self.radio
                 )
 
             # Set up discovery handler if enabled
@@ -1505,6 +1509,7 @@ class RepeaterDaemon:
             stats["sensors"] = self.sensor_manager.get_summary()
 
         stats["radio_status"] = self.radio_status
+        stats["modem_disconnected"] = disconnected_modems(self.config, self.radio)
         if self.radio_error:
             stats["radio_error"] = self.radio_error
 

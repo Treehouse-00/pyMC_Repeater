@@ -85,6 +85,22 @@ def test_broadcast_stats_once_queries_and_broadcasts():
     assert payload["system_stats"]["mode"] == "forward"
 
 
+def test_modem_status_is_in_every_vitals_beat_and_clears_on_reconnect():
+    collector = _make_collector()
+    down = ["modem_tcp"]
+    collector.modem_status_getter = lambda: list(down)
+    collector._broadcast_stats_once()
+    assert collector.websocket_broadcast_stats.call_args.args[0]["system_stats"][
+        "modem_disconnected"
+    ] == ["modem_tcp"]
+    down.clear()
+    collector._broadcast_stats_once()
+    assert (
+        collector.websocket_broadcast_stats.call_args.args[0]["system_stats"]["modem_disconnected"]
+        == []
+    )
+
+
 def test_broadcast_decimates_the_packet_stats_aggregate():
     collector = _make_collector()
 
