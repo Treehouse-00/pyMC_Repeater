@@ -1001,96 +1001,17 @@ paths:
                             settings:
                               type: object
 
+  /sensors_config_update:
     post:
       tags: [Sensors]
       summary: Update sensor configuration
       description: |
-        Update sensor definitions and persist to config.yaml.
-        Requires POST body with enabled, poll_interval_seconds, auto_install_packages, and definitions array.
-        Multiple definitions may use the same type (for example two openhop_modem sensors), but names must be unique.
-        Existing pymc_modem definitions remain supported for compatibility.
-        For an existing sensor, password value ***** keeps its stored password;
-        an empty string clears it, and any other value replaces it. Pass the _original_name
-        returned by GET when renaming a sensor so password preservation stays tied to its
-        original identity, even when another sensor of the same type is added. The field
-        is not persisted; omit it for new definitions.
-        Always returns restart_required=true.
-      security:
-        - BearerAuth: []
-        - ApiKeyAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                enabled:
-                  type: boolean
-                poll_interval_seconds:
-                  type: number
-                  default: 30.0
-                auto_install_packages:
-                  type: boolean
-                  default: false
-                definitions:
-                  type: array
-                  items:
-                    type: object
-                    required: [name, type]
-                    properties:
-                      name:
-                        type: string
-                      _original_name:
-                        type: string
-                        description: Optional origin from GET for an existing definition; not persisted.
-                      type:
-                        type: string
-                      enabled:
-                        type: boolean
-                      auto_install_packages:
-                        type: boolean
-                      settings:
-                        type: object
-            example:
-              enabled: true
-              poll_interval_seconds: 30.0
-              definitions:
-                - name: living-room-temp
-                  type: bme280
-                  enabled: true
-                  settings:
-                    i2c_address: "0x76"
-                    bus_number: 0
-      responses:
-        '200':
-          description: Configuration saved
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                  data:
-                    type: object
-                    properties:
-                      saved:
-                        type: boolean
-                      restart_required:
-                        type: boolean
-                      message:
-                        type: string
-        '405':
-          description: Method not allowed
-
-  /sensors_config_update:
-    post:
-      tags: [Sensors]
-      summary: Update sensor configuration (locked)
-      description: |
-        Update sensor definitions and persist to config.yaml.
-        Uses provisioning lock. Always returns restart_required=true.
+        Update sensor definitions and persist to config.yaml under the provisioning lock.
+        Names must be unique; sensor types may repeat, including existing pymc_modem aliases.
+        Password value ***** preserves an existing secret; an empty string clears it.
+        Pass the _original_name from GET when renaming an existing sensor to preserve
+        its password, even if another sensor of the same type is added. Omit it for
+        new definitions. Always returns restart_required=true.
       security:
         - BearerAuth: []
         - ApiKeyAuth: []

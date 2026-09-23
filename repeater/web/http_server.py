@@ -496,12 +496,16 @@ class StatsApp:
         """Handle client-side routing - serve index.html for all non-API routes."""
         # Sensor APIs live only under /api, where require_auth is enabled.
         # Do not let obsolete root API URLs fall through to the SPA either.
-        if args and args[0] in {
-            "sensors_types",
-            "sensors_config",
-            "sensors_config_update",
-            "sensors_read",
-        }:
+        if args and (
+            args[0] == "api"
+            or args[0]
+            in {
+                "sensors_types",
+                "sensors_config",
+                "sensors_config_update",
+                "sensors_read",
+            }
+        ):
             raise cherrypy.NotFound()
         self._resolve_html_dir()
         # Handle OPTIONS requests for any path

@@ -126,6 +126,12 @@ def test_stats_app_index_and_default_routing(monkeypatch, tmp_path):
     monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
     with pytest.raises(cherrypy.NotFound):
         app.default("api")
+    with pytest.raises(cherrypy.NotFound):
+        app.default("api", "unknown")
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="OPTIONS"), raising=False)
+    with pytest.raises(cherrypy.NotFound):
+        app.default("api")
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
 
     assert app.default("ws", "packets") == ""
     assert app.default("plugins") == "<html>ok</html>"

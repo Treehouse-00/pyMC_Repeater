@@ -1,4 +1,5 @@
 import copy
+import errno
 import logging
 import os
 import stat
@@ -279,11 +280,12 @@ class ConfigManager:
                 logger.exception("Failed to save config to %s", self.config_path)
                 return False
 
-    def _persist_config(self, config: dict) -> bool:
+    def _persist_config(self, config: dict, *, normalize_modem: bool = True) -> bool:
         """Write a private candidate; the atomic replace is the commit point."""
         temporary_path = None
         try:
-            normalize_modem_config_in_place(config)
+            if normalize_modem:
+                normalize_modem_config_in_place(config)
             # Follow existing symlinks rather than replacing the link itself.
             path = os.path.realpath(self.config_path)
             directory = os.path.dirname(path)
@@ -307,10 +309,32 @@ class ConfigManager:
                 )
                 f.flush()
                 if previous is not None:
+                    # A new inode can inherit the directory's default ACL. Remove
+                    # attributes absent from the original before restoring mode;
+                    # otherwise chmod may make an inherited named reader effective.
+                    attributes = ()
+                    if all(
+                        hasattr(os, name)
+                        for name in ("listxattr", "getxattr", "setxattr", "removexattr")
+                    ):
+                        try:
+                            attributes = os.listxattr(path)
+                        except OSError as exc:
+                            if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                                raise
+                            # Filesystem has no xattrs to preserve.
+                        for name in os.listxattr(f.fileno()):
+                            if name not in attributes:
+                                os.removexattr(f.fileno(), name)
                     current = os.fstat(f.fileno())
                     if (current.st_uid, current.st_gid) != (previous.st_uid, previous.st_gid):
                         os.fchown(f.fileno(), previous.st_uid, previous.st_gid)
                     os.fchmod(f.fileno(), stat.S_IMODE(previous.st_mode))
+                    # Ownership and chmod can clear ACL masks/security attributes.
+                    # Apply original xattrs last, before fsync and the commit point;
+                    # any unreadable/unwritable attribute aborts the replacement.
+                    for name in attributes:
+                        os.setxattr(f.fileno(), name, os.getxattr(path, name))
                 os.fsync(f.fileno())
             os.replace(temporary_path, path)
             temporary_path = None

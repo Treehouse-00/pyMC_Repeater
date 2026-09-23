@@ -9033,7 +9033,9 @@ class APIEndpoints:
             ]
         }
         """
-        with self._provisioning_lock:
+        from repeater.config_manager import _CONFIG_WRITE_LOCK
+
+        with self._provisioning_lock, _CONFIG_WRITE_LOCK:
             return self._sensors_config_update_locked()
 
     def _sensors_config_update_locked(self):
@@ -9046,12 +9048,13 @@ class APIEndpoints:
             # Read current config
             try:
                 with open(self._config_path, "r", encoding="utf-8") as f:
-                    config_yaml = yaml.safe_load(f) or {}
-            except Exception:
-                config_yaml = self.config or {}
+                    config_yaml = yaml.safe_load(f)
+            except Exception as e:
+                logger.error("Unable to read sensor config before update: %s", e)
+                return self._error("Failed to read current configuration")
 
             if not isinstance(config_yaml, dict):
-                config_yaml = {}
+                return self._error("Invalid configuration: expected YAML mapping")
 
             # Build updated sensors section
             sensors_section = {
@@ -9123,21 +9126,26 @@ class APIEndpoints:
                     settings["password"] = matches[0]["settings"]["password"]
 
             sensors_section["definitions"] = definitions
+
+            # ConfigManager stages and fsyncs a private file, preserving the
+            # existing ownership/mode and symlink target before atomic replace.
+            # Keep legacy sensor type aliases unchanged (normal modem config
+            # persistence rewrites these aliases).
+            from repeater.config_manager import ConfigManager
+
             config_yaml["sensors"] = sensors_section
+            if not ConfigManager(self._config_path, config_yaml)._persist_config(
+                config_yaml, normalize_modem=False
+            ):
+                return self._error("Failed to save sensor configuration")
 
-            # Write to disk
-            with open(self._config_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(
-                    config_yaml,
-                    f,
-                    default_flow_style=False,
-                    sort_keys=False,
-                    allow_unicode=True,
-                    width=1000000,
-                )
-
-            # Update in-memory config
-            self.config["sensors"] = sensors_section
+            # Publish only after persistence succeeds. Keep section references held
+            # by other daemon components stable.
+            if isinstance(self.config.get("sensors"), dict):
+                self.config["sensors"].clear()
+                self.config["sensors"].update(sensors_section)
+            else:
+                self.config["sensors"] = sensors_section
 
             logger.info("Sensor configuration updated and saved to %s", self._config_path)
             return self._success(
