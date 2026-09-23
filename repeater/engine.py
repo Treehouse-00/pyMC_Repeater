@@ -2144,6 +2144,14 @@ class RepeaterHandler(BaseHandler):
         """
         return self.airtime_budgets.node_stats()
 
+    def airtime_stats_by_radio(self) -> list:
+        """``[{radio_id, ...}]`` per radio, empty on a single-radio node.
+
+        Radios sharing a channel report the same figures because they are the
+        same budget, which is the statement rather than a duplication.
+        """
+        return self.airtime_budgets.per_radio_stats()
+
     def _egress_can_transmit(
         self, packet: Packet, tx_radio_ids: Optional[Tuple[str, ...]]
     ) -> Tuple[bool, float]:
@@ -2454,6 +2462,53 @@ class RepeaterHandler(BaseHandler):
         """Last sample per radio id. Empty on a single-radio node."""
         return dict(self._cached_noise_floor_by_radio)
 
+    def get_crc_error_count(self) -> int:
+        """The node's cumulative CRC error count, summed over its radios.
+
+        The node's, not the default radio's: on a bridge the default radio is
+        one of two receivers, and reporting only its errors leaves a deaf
+        backhaul invisible in every scalar the node publishes. Summing matches
+        what AirtimeBudgets.node_stats does with the airtime counters beside it.
+
+        Every reader of this figure sees the same number -- the MQTT status
+        message's ``stats.errors``, /stats' ``crc_error_count`` and the MeshCore
+        wire response's ``n_recv_errors`` -- so the sum of ``radios[].errors``
+        in a status message reconciles with the scalar. Which radio contributed
+        what stays available per radio, both there and in the crc_errors table.
+        """
+        # Live counts win; a radio the fabric cannot hand back right now falls
+        # back to the last count the sampler read from it. These are lifetime
+        # counters, so dropping a radio from the sum would walk the node's total
+        # backwards and hand an observer reading deltas a negative interval --
+        # the same reason AirtimeBudgets keeps its retired channels' totals.
+        counts = {
+            radio_id: count
+            for radio_id, count in self._crc_error_baselines.items()
+            if radio_id is not None
+        }
+        counts.update(self.get_crc_error_count_by_radio())
+        if counts:
+            return sum(counts.values())
+
+        # Single-radio node: one unlabelled counter, read live.
+        radio = self.dispatcher.radio if self.dispatcher else None
+        return int(getattr(radio, "crc_error_count", 0) or 0) if radio else 0
+
+    def get_crc_error_count_by_radio(self) -> Dict[str, int]:
+        """Each radio's cumulative CRC error count. Empty on a single-radio node.
+
+        Read from the hardware counters rather than the sampler's baselines, so
+        a status message is not pinned to whenever the CRC tick last ran. A
+        radio the fabric cannot hand back is omitted rather than reported as
+        zero: absent and error-free are not the same claim.
+        """
+        counts = {}
+        for radio_id, radio in self._sampling_radios():
+            if radio_id is None or radio is None:
+                continue
+            counts[radio_id] = int(getattr(radio, "crc_error_count", 0) or 0)
+        return counts
+
     def get_stats(self) -> dict:
         runtime_config = normalize_modem_config(self.config, warn=False)
         redact_modem_tokens_in_place(runtime_config)
@@ -2478,8 +2533,7 @@ class RepeaterHandler(BaseHandler):
         noise_floor_dbm = self.get_cached_noise_floor()
 
         # Get CRC error count from radio hardware
-        radio = self.dispatcher.radio if self.dispatcher else None
-        crc_error_count = getattr(radio, "crc_error_count", 0) if radio else 0
+        crc_error_count = self.get_crc_error_count()
 
         # Get neighbors from database
         neighbors = self.storage.get_neighbors() if self.storage else {}

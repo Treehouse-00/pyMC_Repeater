@@ -384,6 +384,62 @@ async def test_crc_errors_publish_only_the_default_radio():
     assert published == {"local"}
 
 
+def test_node_crc_count_sums_every_radio():
+    # The scalar every reader shares -- stats.errors, /stats crc_error_count and
+    # the wire response's n_recv_errors. Reading the default radio alone would
+    # leave a deaf backhaul invisible in all three.
+    handler, _, _ = _bridge_handler()
+
+    assert handler.get_crc_error_count() == 13
+    assert handler.get_crc_error_count_by_radio() == {"local": 4, "link": 9}
+
+
+def test_node_crc_count_reconciles_with_the_per_radio_figures():
+    handler, _, _ = _bridge_handler()
+
+    by_radio = handler.get_crc_error_count_by_radio()
+
+    assert handler.get_crc_error_count() == sum(by_radio.values())
+
+
+def test_a_radio_the_fabric_cannot_hand_back_keeps_its_last_count():
+    # Lifetime counters: a radio going missing does not un-drop the packets it
+    # dropped, and an observer reading these as deltas must never see a negative
+    # interval. The sampler's last reading stands in until the radio is back.
+    handler, local, link = _bridge_handler()
+    handler._crc_error_baselines = {"local": 4, "link": 9}
+
+    def no_link(radio_id):
+        if radio_id == "link":
+            raise KeyError(radio_id)
+        return local
+
+    handler.dispatcher.radio.fabric.get_radio = no_link
+
+    assert handler.get_crc_error_count_by_radio() == {"local": 4}
+    assert handler.get_crc_error_count() == 13
+
+
+def test_a_fabric_down_to_one_radio_still_counts_the_one_that_left():
+    handler, local, _ = _bridge_handler()
+    handler._crc_error_baselines = {"local": 4, "link": 9}
+
+    handler.dispatcher.radio.fabric = _Fabric([("local", local)], "local")
+
+    # One radio needs no label, so it reports unattributed again ...
+    assert handler.get_crc_error_count_by_radio() == {}
+    # ... but the node total does not drop the departed radio's 9.
+    assert handler.get_crc_error_count() == 13
+
+
+def test_single_radio_node_still_reports_its_one_counter():
+    handler = _make_handler()
+    handler.dispatcher.radio.crc_error_count = 5
+
+    assert handler.get_crc_error_count_by_radio() == {}
+    assert handler.get_crc_error_count() == 5
+
+
 # ---------------------------------------------------------------------------
 # API boundary: the endpoints call the storage facade, not the SQLite handler
 # ---------------------------------------------------------------------------

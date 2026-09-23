@@ -239,7 +239,15 @@ class ProtocolRequestHelper:
         n_recv_direct = getattr(self.engine, "recv_direct_count", 0) if self.engine else 0
         n_direct_dups = getattr(self.engine, "direct_dup_count", 0) if self.engine else 0
         n_flood_dups = getattr(self.engine, "flood_dup_count", 0) if self.engine else 0
-        n_recv_errors = int(getattr(self.radio, "crc_error_count", 0) or 0) if self.radio else 0
+        # Via the engine, so this reports the whole node: on a bridge, reading
+        # self.radio answers for the default endpoint only and a deaf backhaul
+        # never reaches the client asking for status.
+        n_recv_errors = 0
+        node_crc_errors = getattr(self.engine, "get_crc_error_count", None) if self.engine else None
+        if callable(node_crc_errors):
+            n_recv_errors = int(node_crc_errors() or 0)
+        elif self.radio:
+            n_recv_errors = int(getattr(self.radio, "crc_error_count", 0) or 0)
 
         # Pack 56-byte RepeaterStats (layout matches firmware)
         stats = struct.pack(

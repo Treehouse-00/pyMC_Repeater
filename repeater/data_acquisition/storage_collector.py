@@ -98,6 +98,7 @@ class StorageCollector:
                     local_identity=local_identity,
                     config=config,
                     stats_provider=self._get_live_stats,
+                    radio_stats_provider=self._get_radio_stats,
                 )
                 self.mqtt_handler.connect()
 
@@ -198,26 +199,43 @@ class StorageCollector:
         # a bridge's stored history covers every radio it transmits on.
         airtime_stats = _node_airtime_stats(self.repeater_handler) or {}
 
-        # Get latest noise floor from database
+        # The default radio's last reading, from memory rather than the newest
+        # row in the table. Every radio's sample is stored now and the default is
+        # sampled first, so the newest row on a Fabric node is the *other*
+        # radio's -- the opposite of the figure a status message reports. The
+        # engine holds the default radio's reading, which is what /stats reads.
         noise_floor = None
-        try:
-            recent_noise = self.sqlite_handler.get_noise_floor_history(hours=0.5, limit=1)
-            if recent_noise and len(recent_noise) > 0:
-                noise_floor = recent_noise[-1].get("noise_floor_dbm")
-        except Exception as e:
-            logger.debug(f"Could not fetch noise floor: {e}")
+        cached_noise_floor = getattr(self.repeater_handler, "get_cached_noise_floor", None)
+        if callable(cached_noise_floor):
+            try:
+                noise_floor = cached_noise_floor()
+            except Exception as e:
+                logger.debug(f"Could not read cached noise floor: {e}")
+
+        # Receive errors: CRC failures, the only error the node actually counts,
+        # summed over its radios so this reconciles with radios[].errors below.
+        # It was published as a literal 0 for as long as the field has existed,
+        # so an observer could not tell a quiet node from a deaf one.
+        errors = 0
+        crc_error_count = getattr(self.repeater_handler, "get_crc_error_count", None)
+        if callable(crc_error_count):
+            try:
+                errors = int(crc_error_count() or 0)
+            except Exception as e:
+                logger.debug(f"Could not read CRC error count: {e}")
 
         stats = {
             "uptime_secs": uptime_secs,
             "packets_sent": self.repeater_handler.forwarded_count,
             "packets_received": self.repeater_handler.rx_count,
-            "errors": 0,
+            "errors": errors,
             "queue_len": 0,  # N/A for Python repeater
         }
 
         # Add airtime stats
         if airtime_stats:
-            stats["tx_air_secs"] = airtime_stats["total_airtime_ms"] / 1000
+            stats["tx_air_secs"] = int(airtime_stats["total_airtime_ms"] / 1000)
+            stats["rx_air_secs"] = int(airtime_stats.get("total_rx_airtime_ms", 0) / 1000)
             stats["current_airtime_ms"] = airtime_stats["current_airtime_ms"]
             stats["utilization_percent"] = airtime_stats["utilization_percent"]
 
@@ -226,6 +244,67 @@ class StorageCollector:
             stats["noise_floor"] = noise_floor
 
         return stats
+
+    def _get_radio_stats(self) -> dict:
+        """``{radio_id: {...}}`` for the status message's radio map.
+
+        Empty on a single-radio node, whose one radio is already what every
+        figure in ``stats`` describes. On a bridge the node-wide figures cannot
+        say which side is carrying the traffic or which side has gone deaf, so
+        each radio reports its own, under the same field names ``stats`` uses.
+
+        Each source contributes independently: a radio with a noise floor but no
+        airtime budget still reports the noise floor. Airtime is whole seconds
+        here too, matching the node-level counters.
+        """
+        if not self.repeater_handler:
+            return {}
+
+        radios: dict = {}
+
+        def entry(radio_id) -> dict:
+            return radios.setdefault(str(radio_id), {})
+
+        for source, apply_to in (
+            ("airtime_stats_by_radio", self._apply_radio_airtime),
+            ("get_cached_noise_floor_by_radio", self._apply_radio_noise_floor),
+            ("get_crc_error_count_by_radio", self._apply_radio_errors),
+        ):
+            getter = getattr(self.repeater_handler, source, None)
+            if not callable(getter):
+                continue
+            try:
+                apply_to(getter(), entry)
+            except Exception as e:
+                logger.debug(f"Could not read {source} for the status radio map: {e}")
+
+        return radios
+
+    @staticmethod
+    def _apply_radio_airtime(per_radio: list, entry) -> None:
+        for radio in per_radio or []:
+            radio_id = radio.get("radio_id")
+            if radio_id is None:
+                continue
+            entry(radio_id).update(
+                {
+                    "tx_air_secs": int(radio.get("total_airtime_ms", 0) / 1000),
+                    "rx_air_secs": int(radio.get("total_rx_airtime_ms", 0) / 1000),
+                    "current_airtime_ms": radio.get("current_airtime_ms", 0),
+                    "utilization_percent": radio.get("utilization_percent", 0),
+                }
+            )
+
+    @staticmethod
+    def _apply_radio_noise_floor(by_radio: dict, entry) -> None:
+        for radio_id, noise_floor_dbm in (by_radio or {}).items():
+            if noise_floor_dbm is not None:
+                entry(radio_id)["noise_floor"] = noise_floor_dbm
+
+    @staticmethod
+    def _apply_radio_errors(by_radio: dict, entry) -> None:
+        for radio_id, count in (by_radio or {}).items():
+            entry(radio_id)["errors"] = int(count)
 
     def record_packet(
         self,

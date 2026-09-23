@@ -642,6 +642,7 @@ class MeshCoreToMqttPusher:
         config: dict,
         jwt_expiry_minutes: int = 10,
         stats_provider: Optional[Callable[[], dict]] = None,
+        radio_stats_provider: Optional[Callable[[], dict]] = None,
     ):
         self.config = config
         # Store local identity and get public key
@@ -664,6 +665,7 @@ class MeshCoreToMqttPusher:
         self.app_version = __version__
         self.radio_config = node_info["radio_config"]
         self.stats_provider = stats_provider
+        self.radio_stats_provider = radio_stats_provider
         self._status_task = None
         self._running = False
         self._shutdown_requested = False
@@ -1005,7 +1007,10 @@ class MeshCoreToMqttPusher:
             "radio": radio_config or self.radio_config,
             "client_version": f"openhop_repeater/{self.app_version}",
             "repeat": repeat_state,
-            "stats": {**live_stats, "errors": 0, "queue_len": 0, **(extra_stats or {})},
+            # Defaults first: a provider that reports real figures must win over
+            # them. Spread after live_stats, as they were, they pinned errors to
+            # 0 no matter what the node had counted.
+            "stats": {"errors": 0, "queue_len": 0, **live_stats, **(extra_stats or {})},
         }
 
         radios = self._radio_map()
@@ -1049,6 +1054,13 @@ class MeshCoreToMqttPusher:
 
         Rebuilt per status publish rather than cached at construction, because
         air settings can be changed from the web UI while the node runs.
+
+        Each entry also carries that radio's own telemetry where the node can
+        report it -- the figures in ``stats`` are one set for the whole node, so
+        on a bridge they cannot say which side is busy or which side has gone
+        deaf. An observer that ignores ``radios`` reads exactly what it read
+        before, and telemetry is merged in rather than replacing the map, so a
+        radio the node has no figures for still attributes its packets.
         """
         from ..config import build_radio_status_entries
 
@@ -1057,7 +1069,20 @@ class MeshCoreToMqttPusher:
         except Exception as exc:  # pragma: no cover - reporting must not break status
             logger.debug(f"Could not build radio map for status: {exc}")
             return []
-        return entries if len(entries) > 1 else []
+        if len(entries) <= 1:
+            return []
+        telemetry = self._radio_telemetry()
+        return [{**entry, **telemetry.get(entry["id"], {})} for entry in entries]
+
+    def _radio_telemetry(self) -> dict:
+        """``{radio_id: {...}}`` from the provider, or empty when there is none."""
+        if not self.radio_stats_provider:
+            return {}
+        try:
+            return self.radio_stats_provider() or {}
+        except Exception as exc:  # pragma: no cover - reporting must not break status
+            logger.debug(f"Could not read per-radio telemetry for status: {exc}")
+            return {}
 
     def publish(self, subtopic: str, payload: dict, retain: bool = False, qos: int = 0):
         """Publish message to all connected brokers"""
