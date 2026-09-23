@@ -491,43 +491,22 @@ class StatsApp:
             logger.error(f"Error serving index.html: {e}")
             raise cherrypy.HTTPError(500, "Internal server error")
 
-    # ============================================================================
-    # Sensor Manager endpoint delegation (APIEndpoints methods → StatsApp)
-    # ============================================================================
-
-    @cherrypy.expose
-    @cherrypy.tools.json_out()
-    def sensors_types(self):
-        """Delegate to APIEndpoints.sensors_types()."""
-        return self.api.sensors_types()
-
-    @cherrypy.expose
-    @cherrypy.tools.json_out()
-    def sensors_config(self):
-        """Delegate to APIEndpoints.sensors_config()."""
-        return self.api.sensors_config()
-
-    @cherrypy.expose
-    @cherrypy.tools.json_out()
-    @cherrypy.tools.json_in()
-    def sensors_config_update(self):
-        """Delegate to APIEndpoints.sensors_config_update()."""
-        return self.api.sensors_config_update()
-
-    @cherrypy.expose
-    @cherrypy.tools.json_out()
-    def sensors_read(self):
-        """Delegate to APIEndpoints.sensors_read()."""
-        return self.api.sensors_read()
-
     @cherrypy.expose
     def default(self, *args, **kwargs):
         """Handle client-side routing - serve index.html for all non-API routes."""
+        # Sensor APIs live only under /api, where require_auth is enabled.
+        # Do not let obsolete root API URLs fall through to the SPA either.
+        if args and args[0] in {
+            "sensors_types",
+            "sensors_config",
+            "sensors_config_update",
+            "sensors_read",
+        }:
+            raise cherrypy.NotFound()
         self._resolve_html_dir()
         # Handle OPTIONS requests for any path
         if cherrypy.request.method == "OPTIONS":
             return ""
-
 
         # Application UI plugins: /plugins/{id}/...
         if args and args[0] == "plugins":

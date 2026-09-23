@@ -910,7 +910,9 @@ paths:
     get:
       tags: [Sensors]
       summary: List available sensor types
-      description: Returns all registered sensor types with their settings schemas.
+      description: |
+        Discover installed sensor modules and return registered types with their settings schemas.
+        Compatibility aliases such as pymc_modem remain loadable from existing definitions but are omitted from add-new choices.
       responses:
         '200':
           description: Sensor types list
@@ -956,7 +958,11 @@ paths:
     get:
       tags: [Sensors]
       summary: Get current sensor configuration
-      description: Returns the current sensor definitions from config.yaml.
+      description: |
+        Returns current sensor definitions. Nonempty settings.password values are
+        masked as *****; stored credentials are never included in this response.
+        Each definition also includes _original_name so the client can preserve
+        its password safely when renaming it while adding another sensor of the same type.
       responses:
         '200':
           description: Sensor configuration
@@ -983,6 +989,9 @@ paths:
                           properties:
                             name:
                               type: string
+                            _original_name:
+                              type: string
+                              description: The stored name used for masked-password round trips; not persisted on update.
                             type:
                               type: string
                             enabled:
@@ -998,6 +1007,13 @@ paths:
       description: |
         Update sensor definitions and persist to config.yaml.
         Requires POST body with enabled, poll_interval_seconds, auto_install_packages, and definitions array.
+        Multiple definitions may use the same type (for example two openhop_modem sensors), but names must be unique.
+        Existing pymc_modem definitions remain supported for compatibility.
+        For an existing sensor, password value ***** keeps its stored password;
+        an empty string clears it, and any other value replaces it. Pass the _original_name
+        returned by GET when renaming a sensor so password preservation stays tied to its
+        original identity, even when another sensor of the same type is added. The field
+        is not persisted; omit it for new definitions.
         Always returns restart_required=true.
       security:
         - BearerAuth: []
@@ -1025,6 +1041,9 @@ paths:
                     properties:
                       name:
                         type: string
+                      _original_name:
+                        type: string
+                        description: Optional origin from GET for an existing definition; not persisted.
                       type:
                         type: string
                       enabled:
@@ -1098,6 +1117,9 @@ paths:
                     properties:
                       name:
                         type: string
+                      _original_name:
+                        type: string
+                        description: Optional origin from GET for an existing definition; not persisted.
                       type:
                         type: string
                       enabled:

@@ -8924,17 +8924,21 @@ class APIEndpoints:
     def sensors_types(self):
         """Return list of available sensor types with their settings schemas."""
         try:
+            import importlib
+            import pkgutil
+
+            import repeater.sensors as sensor_package
             from repeater.sensors import SensorRegistry
-            from repeater.sensors import bme280 as _bme280  # noqa: F401
-            from repeater.sensors import ens210 as _ens210  # noqa: F401
-            from repeater.sensors import hardware_stats as _hw  # noqa: F401
-            from repeater.sensors import ina219 as _ina219  # noqa: F401
-            from repeater.sensors import lafvin_ups_3s as _lafvin  # noqa: F401
-            from repeater.sensors import openhop_modem as _modem  # noqa: F401
-            from repeater.sensors import pymc_modem as _pymc  # noqa: F401
-            from repeater.sensors import shtc3 as _shtc3  # noqa: F401
-            from repeater.sensors import waveshare_ups_d as _upsd  # noqa: F401
-            from repeater.sensors import waveshare_ups_e as _upse  # noqa: F401
+
+            # Import installed modules so their registry decorators run. Sensor
+            # modules should defer optional hardware imports until read time.
+            for module in pkgutil.iter_modules(sensor_package.__path__):
+                if module.name.startswith("_") or module.name in {"base", "manager", "registry"}:
+                    continue
+                try:
+                    importlib.import_module(f"repeater.sensors.{module.name}")
+                except ImportError as exc:
+                    logger.warning("Skipping unavailable sensor module %s: %s", module.name, exc)
 
             type_descriptions = {
                 "bme280": "Temperature, humidity, and barometric pressure",
@@ -8950,6 +8954,10 @@ class APIEndpoints:
 
             types = []
             for sensor_type in SensorRegistry.available_types():
+                # Compatibility aliases remain loadable for existing definitions,
+                # but are not choices for newly configured sensors.
+                if sensor_type == "pymc_modem":
+                    continue
                 entry = {"type": sensor_type}
                 if sensor_type in type_descriptions:
                     entry["name"] = sensor_type.replace("_", " ").title()
@@ -8983,15 +8991,27 @@ class APIEndpoints:
             if not isinstance(section, dict):
                 section = {}
 
+            from copy import deepcopy
+
             definitions = section.get("definitions", [])
             if not isinstance(definitions, list):
                 definitions = []
+            public_definitions = deepcopy(definitions)
+            for definition in public_definitions:
+                if isinstance(definition, dict):
+                    # A stable client-side identity survives a rename in the same
+                    # edit session, even after another sensor of this type is added.
+                    definition["_original_name"] = definition.get("name")
+                if isinstance(definition, dict) and isinstance(definition.get("settings"), dict):
+                    for key, value in definition["settings"].items():
+                        if key.lower() == "password" and value:
+                            definition["settings"][key] = "*****"
 
             return self._success({
                 "enabled": bool(section.get("enabled", False)),
                 "poll_interval_seconds": float(section.get("poll_interval_seconds", 30.0)),
                 "auto_install_packages": bool(section.get("auto_install_packages", False)),
-                "definitions": definitions,
+                "definitions": public_definitions,
             })
         except Exception as e:
             logger.error(f"Error reading sensor config: {e}", exc_info=True)
@@ -9040,18 +9060,67 @@ class APIEndpoints:
                 "auto_install_packages": bool(body.get("auto_install_packages", False)),
             }
 
-            definitions = body.get("definitions", [])
+            from copy import deepcopy
+
+            definitions = deepcopy(body.get("definitions", []))
             if not isinstance(definitions, list):
                 return self._error("definitions must be an array")
+            old_section = config_yaml.get("sensors", {})
+            old_definitions = old_section.get("definitions", []) if isinstance(old_section, dict) else []
+            if not isinstance(old_definitions, list):
+                old_definitions = []
 
-            # Validate each definition
+            # Names key the poller's reading/interval caches; types may repeat,
+            # but names must remain unique across all configured sensors.
+            names = set()
+            origins = set()
             for i, defn in enumerate(definitions):
                 if not isinstance(defn, dict):
                     return self._error(f"definitions[{i}] must be an object")
+                original_name = defn.pop("_original_name", None)
+                if original_name is not None:
+                    origin = (str(defn.get("type")), original_name)
+                    if not isinstance(original_name, str) or origin in origins:
+                        return self._error(f"definitions[{i}] has an invalid sensor origin")
+                    origins.add(origin)
                 if "type" not in defn:
                     return self._error(f"definitions[{i}] missing required 'type' field")
                 if "name" not in defn:
                     return self._error(f"definitions[{i}] missing required 'name' field")
+                name = defn["name"]
+                if not isinstance(name, str) or not name.strip():
+                    return self._error(f"definitions[{i}] name must be a nonempty string")
+                if name in names:
+                    return self._error(f"Duplicate sensor name: {name}")
+                names.add(name)
+                # Preserve masked credentials by stable sensor identity, not list position.
+                settings = defn.get("settings")
+                if isinstance(settings, dict) and settings.get("password") == "*****":
+                    lookup_name = original_name if original_name is not None else defn["name"]
+                    matches = [
+                        old for old in old_definitions
+                        if isinstance(old, dict)
+                        and old.get("name") == lookup_name
+                        and old.get("type") == defn["type"]
+                        and isinstance(old.get("settings"), dict)
+                    ]
+                    if not matches and original_name is None:
+                        # Legacy clients without an origin can rename only when
+                        # this type is unique on both sides.
+                        old_same_type = [
+                            old for old in old_definitions
+                            if isinstance(old, dict) and old.get("type") == defn["type"]
+                            and isinstance(old.get("settings"), dict)
+                        ]
+                        new_same_type = [
+                            new for new in definitions
+                            if isinstance(new, dict) and new.get("type") == defn["type"]
+                        ]
+                        if len(old_same_type) == len(new_same_type) == 1:
+                            matches = old_same_type
+                    if len(matches) != 1 or not matches[0]["settings"].get("password"):
+                        return self._error(f"definitions[{i}] cannot preserve password")
+                    settings["password"] = matches[0]["settings"]["password"]
 
             sensors_section["definitions"] = definitions
             config_yaml["sensors"] = sensors_section

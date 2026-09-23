@@ -132,6 +132,20 @@ def test_stats_app_index_and_default_routing(monkeypatch, tmp_path):
     assert app.default("route") == "<html>ok</html>"
 
 
+def test_root_sensor_api_aliases_are_not_exposed(monkeypatch, tmp_path):
+    (tmp_path / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+    fake_api = SimpleNamespace(config_manager=object(), docs=lambda: "d")
+    monkeypatch.setattr(hs, "APIEndpoints", lambda *args, **kwargs: fake_api)
+    app = hs.StatsApp(config={"web": {"web_path": str(tmp_path)}})
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
+
+    for name in ("sensors_config", "sensors_config_update", "sensors_types", "sensors_read"):
+        assert not hasattr(app, name)
+        with pytest.raises(cherrypy.NotFound):
+            app.default(name)
+    assert app.default("sensors") == "<html>ok</html>"
+
+
 def test_stats_app_exposes_compiled_ui_favicon(monkeypatch, tmp_path):
     favicon = b"compiled-ui-favicon"
     (tmp_path / "favicon.ico").write_bytes(favicon)

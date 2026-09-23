@@ -36,7 +36,7 @@ class OpenHopModemSensor(SensorBase):
 
     _settings_schema = [
         {"key": "host", "type": "string", "label": "Host", "default": "", "help": "Modem hostname or IP address"},
-        {"key": "port", "type": "integer", "label": "Port", "default": 5055, "help": "Modem HTTP port"},
+        {"key": "port", "type": "integer", "label": "Port", "default": 80, "help": "Modem HTTP API port (not the radio TCP port)"},
         {"key": "scheme", "type": "string", "label": "Scheme", "default": "http", "help": "HTTP or HTTPS"},
         {"key": "endpoint", "type": "string", "label": "Endpoint", "default": "/api/stats", "help": "Stats API path"},
         {"key": "username", "type": "string", "label": "Username", "default": "admin", "help": "Basic auth username"},

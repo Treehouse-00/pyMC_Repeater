@@ -12,7 +12,7 @@ Sensors in openhop-repeater are self-contained modules that live in `repeater/se
 | `SensorRegistry` | `repeater/sensors/registry.py` | Maps type strings → sensor classes via `@SensorRegistry.register` |
 | `SensorManager` | `repeater/sensors/manager.py` | Reads config, imports sensor modules, polls sensors in background |
 
-When `SensorManager` loads a sensor of type `"foo"`, it calls `importlib.import_module("repeater.sensors.foo")`. That import runs the `@SensorRegistry.register("foo")` decorator on your class, making it available. No changes to `__init__.py` or the manager are needed.
+When `SensorManager` loads a configured sensor of type `"foo"`, it imports `repeater.sensors.foo`. The Sensor Manager API also imports installed sensor modules before enumerating `SensorRegistry`, so the UI's Add Sensor menu discovers new types without a hardcoded frontend list. Give the class a `_settings_schema` for its dynamic form; installing a module does not automatically create a sensor definition or detect physical hardware. Restart the backend after installing code, then add/configure the sensor in the UI.
 
 ---
 
@@ -50,6 +50,9 @@ from .registry import SensorRegistry
 @SensorRegistry.register("<type>")
 class MySensor(SensorBase):
     sensor_type = "<type>"
+    _settings_schema = [
+        {"key": "some_option", "type": "string", "label": "Some Option", "default": "default"},
+    ]
 
     def __init__(self, name: str, config: Optional[Dict[str, Any]] = None, log=None):
         super().__init__(name=name, config=config, log=log)
@@ -90,6 +93,7 @@ class MySensor(SensorBase):
 Key rules:
 
 - **`sensor_type`** class attribute must match the string passed to `@SensorRegistry.register`.
+- Multiple definitions may use the same sensor type (for example two `openhop_modem` instances), but each must have a unique name: the poller caches readings by name. The `pymc_modem` alias remains loadable for old configurations but is not offered as a new type in Sensor Manager.
 - **`self.settings`** is the `settings:` block from the sensor's config entry (a plain dict).
 - **`ensure_python_modules`** handles missing dependencies gracefully. Pass a multi-line list of `(import_name, pip_package)` tuples. Returns `False` and logs a warning if any are missing and `auto_install_packages` is `false`; installs them via pip if `true`. Sensor-specific packages belong here — do **not** add them to `pyproject.toml`.
 - **`_read`** must return a flat `dict[str, Any]`. The base class wraps it in a standard envelope (`name`, `type`, `ok`, `timestamp`, `data`, optional `error`).

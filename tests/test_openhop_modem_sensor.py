@@ -129,6 +129,16 @@ def test_openhop_modem_sensor_exposes_full_flat_diagnostics(monkeypatch):
     assert data["solar_charge_rate_percent_per_hour"] == 4.5
 
 
+def test_modem_sensor_defaults_to_http_port_not_radio_tcp_port():
+    defaults = {field["key"]: field["default"] for field in OpenHopModemSensor._settings_schema}
+    assert defaults["port"] == 80
+    defaults["host"] = "modem.local"
+    sensor = OpenHopModemSensor("modem", {"settings": defaults})
+    assert sensor.url == "http://modem.local:80/api/stats"
+    explicit = OpenHopModemSensor("other", {"settings": {"host": "modem.local", "port": 8080}})
+    assert explicit.url == "http://modem.local:8080/api/stats"
+
+
 def test_openhop_modem_sensor_accepts_legacy_token_flag():
     sensor = OpenHopModemSensor("modem", {"settings": {"base_url": "http://openhop-modem.local"}})
 
