@@ -9007,12 +9007,14 @@ class APIEndpoints:
                         if key.lower() == "password" and value:
                             definition["settings"][key] = "*****"
 
-            return self._success({
-                "enabled": bool(section.get("enabled", False)),
-                "poll_interval_seconds": float(section.get("poll_interval_seconds", 30.0)),
-                "auto_install_packages": bool(section.get("auto_install_packages", False)),
-                "definitions": public_definitions,
-            })
+            return self._success(
+                {
+                    "enabled": bool(section.get("enabled", False)),
+                    "poll_interval_seconds": float(section.get("poll_interval_seconds", 30.0)),
+                    "auto_install_packages": bool(section.get("auto_install_packages", False)),
+                    "definitions": public_definitions,
+                }
+            )
         except Exception as e:
             logger.error(f"Error reading sensor config: {e}", exc_info=True)
             return self._error(str(e))
@@ -9069,7 +9071,9 @@ class APIEndpoints:
             if not isinstance(definitions, list):
                 return self._error("definitions must be an array")
             old_section = config_yaml.get("sensors", {})
-            old_definitions = old_section.get("definitions", []) if isinstance(old_section, dict) else []
+            old_definitions = (
+                old_section.get("definitions", []) if isinstance(old_section, dict) else []
+            )
             if not isinstance(old_definitions, list):
                 old_definitions = []
 
@@ -9101,7 +9105,8 @@ class APIEndpoints:
                 if isinstance(settings, dict) and settings.get("password") == "*****":
                     lookup_name = original_name if original_name is not None else defn["name"]
                     matches = [
-                        old for old in old_definitions
+                        old
+                        for old in old_definitions
                         if isinstance(old, dict)
                         and old.get("name") == lookup_name
                         and old.get("type") == defn["type"]
@@ -9111,12 +9116,15 @@ class APIEndpoints:
                         # Legacy clients without an origin can rename only when
                         # this type is unique on both sides.
                         old_same_type = [
-                            old for old in old_definitions
-                            if isinstance(old, dict) and old.get("type") == defn["type"]
+                            old
+                            for old in old_definitions
+                            if isinstance(old, dict)
+                            and old.get("type") == defn["type"]
                             and isinstance(old.get("settings"), dict)
                         ]
                         new_same_type = [
-                            new for new in definitions
+                            new
+                            for new in definitions
                             if isinstance(new, dict) and new.get("type") == defn["type"]
                         ]
                         if len(old_same_type) == len(new_same_type) == 1:
@@ -9175,16 +9183,18 @@ class APIEndpoints:
             readings = manager.read_all()
             summary = manager.get_summary()
 
-            return self._success({
-                "readings": readings,
-                "summary": {
-                    "enabled": summary["enabled"],
-                    "poll_interval_seconds": summary["poll_interval_seconds"],
-                    "configured": summary["configured"],
-                    "loaded": summary["loaded"],
-                    "running": summary["running"],
-                },
-            })
+            return self._success(
+                {
+                    "readings": readings,
+                    "summary": {
+                        "enabled": summary["enabled"],
+                        "poll_interval_seconds": summary["poll_interval_seconds"],
+                        "configured": summary["configured"],
+                        "loaded": summary["loaded"],
+                        "running": summary["running"],
+                    },
+                }
+            )
         except Exception as e:
             logger.error(f"Error reading sensors: {e}", exc_info=True)
             return self._error(str(e))
