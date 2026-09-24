@@ -718,6 +718,8 @@ class CompanionAPIEndpoints:
                         item = client_queue.get(timeout=float(self._sse_keepalive_sec))
                         yield f"data: {json.dumps(item)}\n\n"
                     except queue.Empty:
+                        if client_queue not in self._sse_clients:
+                            return  # dropped for overflowing; ending lets the client reconnect
                         # Keep-alive comment frame keeps EventSource connected
                         # without allocating additional JSON payload objects.
                         yield ": keepalive\n\n"
