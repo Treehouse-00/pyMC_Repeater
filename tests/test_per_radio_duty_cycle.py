@@ -1173,3 +1173,79 @@ def test_the_default_radio_adopts_its_new_modulation_once_it_is_applied():
     manager._refresh_airtime_radio_params(default_radio_applied=True)
 
     assert handler.airtime_budgets.for_radio("local").bandwidth == NARROW["bandwidth"]
+
+
+# ---------------------------------------------------------------------------
+# What a partial radios[] entry is metered on
+# ---------------------------------------------------------------------------
+# Deliberately unlike the library fallback (62.5 kHz / SF8 / CR8) on every
+# field, so a profile built from defaults cannot be mistaken for one built from
+# the node's own block.
+SLOW = {
+    "frequency": 869618000,
+    "bandwidth": 125000,
+    "spreading_factor": 12,
+    "coding_rate": 5,
+    "preamble_length": 32,
+}
+LIBRARY_FALLBACK = dict(SLOW, bandwidth=62500, spreading_factor=8, coding_rate=8)
+
+
+def _inheriting_config(radios: list) -> dict:
+    """A node whose top-level block is the defaults its entries inherit."""
+    config = _config(radios)
+    config["radio_type"] = "sx1262"
+    config["radio"] = dict(SLOW)
+    return config
+
+
+PARTIAL_LINK = {"id": "link", "radio": {"frequency": 910525000}}
+
+
+def test_a_partial_entry_is_metered_on_the_nodes_own_air_settings():
+    """An entry that states only its frequency used to be metered on library
+    defaults rather than on the block it inherits from."""
+    inherited = AirtimeBudgets(_inheriting_config([PARTIAL_LINK]))
+    explicit = AirtimeBudgets(_inheriting_config([_radio("link", dict(SLOW, frequency=910525000))]))
+
+    assert inherited.for_radio("link").spreading_factor == 12
+    assert inherited.for_radio("link").bandwidth == 125000
+    assert inherited.for_radio("link").calculate_airtime(50) == pytest.approx(
+        explicit.for_radio("link").calculate_airtime(50)
+    )
+
+
+def test_a_partial_entry_is_not_metered_faster_than_it_transmits():
+    """The hazard stated plainly: the old library-default profile charges a
+    fraction of the real time on air, and under-charging is the wrong direction
+    to be wrong about a legal limit."""
+    inherited = AirtimeBudgets(_inheriting_config([PARTIAL_LINK]))
+    fallback = AirtimeBudgets(
+        _inheriting_config([_radio("link", dict(LIBRARY_FALLBACK, frequency=910525000))])
+    )
+
+    charged = inherited.for_radio("link").calculate_airtime(50)
+    would_have_charged = fallback.for_radio("link").calculate_airtime(50)
+
+    assert charged > would_have_charged * 4
+
+
+def test_a_partial_entry_lands_on_the_channel_its_inherited_bandwidth_puts_it_on():
+    """Channels are keyed on (frequency, bandwidth), so an entry metered at a
+    defaulted bandwidth would be budgeted as a channel of its own rather than
+    alongside the radio it actually shares spectrum with."""
+    budgets = AirtimeBudgets(
+        _inheriting_config(
+            [
+                PARTIAL_LINK,
+                _radio("twin", dict(SLOW, frequency=910525000)),
+                _radio("elsewhere", dict(LIBRARY_FALLBACK, frequency=910525000)),
+            ]
+        )
+    )
+
+    assert budgets.shares_budget("link", "twin")
+    assert not budgets.shares_budget("link", "elsewhere")
+
+    budgets.for_radio("twin").record_tx(3600)
+    assert budgets.for_radio("link").can_transmit(10)[0] is False

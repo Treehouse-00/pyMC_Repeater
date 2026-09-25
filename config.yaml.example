@@ -417,9 +417,21 @@ identities:
 # Multi-radio / LoRa backhaul (optional)
 # ---------------------------------------------------------------------------
 # Leave ``radios:`` unset to keep the legacy single-radio config below.
-# When present, each entry is built with the same fields as the top-level
-# single-radio config (radio_type + radio air settings + hardware section).
-# Different entries may use different frequency / SF / modem type.
+# When present, each entry defines one physical radio.
+#
+# Top-level radio/hardware sections act as defaults for each entry.
+# Mapping sections under radios[] overlay those defaults key-by-key:
+# omitted values are inherited, while values explicitly present in an
+# entry override the top-level setting.
+#
+# This allows board-specific settings such as use_dio3_tcxo,
+# use_dio2_rf, dio3_tcxo_voltage, en_pin/en_pins, GPIO settings, etc.
+# to remain in the top-level hardware configuration unless a particular
+# radio needs a different value.
+#
+# radio_type may also be overridden per entry, so different transport
+# types can be mixed in the same fabric. Different entries may use
+# different frequency / SF / modem type.
 #
 # fabric:
 #   default_radio: local          # TX default (first entry if omitted)
@@ -515,7 +527,29 @@ identities:
 #       txen_pin: -1
 #       rxen_pin: -1
 #
-# Radio hardware type (legacy single-radio; ignored for construction when radios: is set)
+# Entries only need the values that differ. The sx1262: section further down
+# holds board-wide properties such as TCXO / RF-switch control and enable
+# pins; those are inherited by every entry that does not override them:
+#
+# radios:
+#   - id: local
+#     radio:
+#       frequency: 910525000
+#     sx1262:
+#       cs_id: 0
+#
+#   - id: link
+#     radio:
+#       frequency: 914500000
+#     sx1262:
+#       cs_id: 1
+#       reset_pin: 27
+#       irq_pin: 18
+#
+# Default radio hardware type.
+# In legacy single-radio mode this selects the physical radio directly.
+# With radios: configured, entries inherit this value unless they specify
+# their own radio_type.
 # Supported:
 #   - sx1262        (Linux spidev + system GPIO)
 #   - sx1262_ch341  (CH341 USB-to-SPI + CH341 GPIO 0-7)
