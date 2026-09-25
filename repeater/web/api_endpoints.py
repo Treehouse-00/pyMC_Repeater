@@ -8915,6 +8915,290 @@ class APIEndpoints:
             logger.error(f"DB vacuum error: {e}", exc_info=True)
             return self._error(str(e))
 
+    # ============================================================================
+    # SENSOR MANAGER ENDPOINTS
+    # ============================================================================
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def sensors_types(self):
+        """Return list of available sensor types with their settings schemas."""
+        try:
+            import importlib
+            import pkgutil
+
+            import repeater.sensors as sensor_package
+            from repeater.sensors import SensorRegistry
+
+            # Import installed modules so their registry decorators run. Sensor
+            # modules should defer optional hardware imports until read time.
+            for module in pkgutil.iter_modules(sensor_package.__path__):
+                if module.name.startswith("_") or module.name in {"base", "manager", "registry"}:
+                    continue
+                try:
+                    importlib.import_module(f"repeater.sensors.{module.name}")
+                except ImportError as exc:
+                    logger.warning("Skipping unavailable sensor module %s: %s", module.name, exc)
+
+            type_descriptions = {
+                "bme280": "Temperature, humidity, and barometric pressure",
+                "ens210": "Relative humidity and temperature",
+                "hardware_stats": "CPU, memory, disk, and system metrics",
+                "ina219": "Current, voltage, and power monitor",
+                "lafvin_ups_3s": "3S Li-ion/LiPo battery monitor (via INA219)",
+                "openhop_modem": "openHop Modem diagnostics",
+                "shtc3": "Temperature and humidity",
+                "waveshare_ups_d": "Single-cell battery monitor (via INA219)",
+                "waveshare_ups_e": "Multi-cell battery monitor (BMS MCU)",
+            }
+
+            types = []
+            for sensor_type in SensorRegistry.available_types():
+                # Compatibility aliases remain loadable for existing definitions,
+                # but are not choices for newly configured sensors.
+                if sensor_type == "pymc_modem":
+                    continue
+                entry = {"type": sensor_type}
+                if sensor_type in type_descriptions:
+                    entry["name"] = sensor_type.replace("_", " ").title()
+                    entry["description"] = type_descriptions[sensor_type]
+                else:
+                    entry["name"] = sensor_type
+                    entry["description"] = ""
+
+                # Collect _settings_schema from all registered factories
+                factory = SensorRegistry._factories.get(sensor_type)
+                schema = []
+                if factory is not None:
+                    if hasattr(factory, "_settings_schema"):
+                        schema = list(factory._settings_schema)
+                    elif isinstance(factory, type) and hasattr(factory, "_settings_schema"):
+                        schema = list(factory._settings_schema)
+                entry["settings"] = schema
+                types.append(entry)
+
+            return self._success({"types": types})
+        except Exception as e:
+            logger.error(f"Error listing sensor types: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def sensors_config(self):
+        """Return current sensor configuration from config.yaml."""
+        try:
+            section = self.config.get("sensors", {})
+            if not isinstance(section, dict):
+                section = {}
+
+            from copy import deepcopy
+
+            definitions = section.get("definitions", [])
+            if not isinstance(definitions, list):
+                definitions = []
+            public_definitions = deepcopy(definitions)
+            for definition in public_definitions:
+                if isinstance(definition, dict):
+                    # A stable client-side identity survives a rename in the same
+                    # edit session, even after another sensor of this type is added.
+                    definition["_original_name"] = definition.get("name")
+                if isinstance(definition, dict) and isinstance(definition.get("settings"), dict):
+                    for key, value in definition["settings"].items():
+                        if key.lower() == "password" and value:
+                            definition["settings"][key] = "*****"
+
+            return self._success(
+                {
+                    "enabled": bool(section.get("enabled", False)),
+                    "poll_interval_seconds": float(section.get("poll_interval_seconds", 30.0)),
+                    "auto_install_packages": bool(section.get("auto_install_packages", False)),
+                    "definitions": public_definitions,
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error reading sensor config: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    @cherrypy.tools.json_in()
+    def sensors_config_update(self):
+        """Update sensor configuration and persist to config.yaml.
+
+        POST /api/sensors/config
+        Body: {
+            "enabled": true,
+            "poll_interval_seconds": 30.0,
+            "auto_install_packages": false,
+            "definitions": [
+                {"name": "living-room-temp", "type": "bme280", "enabled": true, "auto_install_packages": false, "settings": {"i2c_address": "0x76", "bus_number": 0}}
+            ]
+        }
+        """
+        from repeater.config_manager import _CONFIG_WRITE_LOCK
+
+        with self._provisioning_lock, _CONFIG_WRITE_LOCK:
+            return self._sensors_config_update_locked()
+
+    def _sensors_config_update_locked(self):
+        try:
+            self._require_post()
+            body = cherrypy.request.json or {}
+            if not isinstance(body, dict):
+                return self._error("Invalid payload: expected JSON object")
+
+            # Read current config
+            try:
+                with open(self._config_path, "r", encoding="utf-8") as f:
+                    config_yaml = yaml.safe_load(f)
+            except Exception as e:
+                logger.error("Unable to read sensor config before update: %s", e)
+                return self._error("Failed to read current configuration")
+
+            if not isinstance(config_yaml, dict):
+                return self._error("Invalid configuration: expected YAML mapping")
+
+            # Build updated sensors section
+            sensors_section = {
+                "enabled": bool(body.get("enabled", False)),
+                "poll_interval_seconds": float(body.get("poll_interval_seconds", 30.0)),
+                "auto_install_packages": bool(body.get("auto_install_packages", False)),
+            }
+
+            from copy import deepcopy
+
+            definitions = deepcopy(body.get("definitions", []))
+            if not isinstance(definitions, list):
+                return self._error("definitions must be an array")
+            old_section = config_yaml.get("sensors", {})
+            old_definitions = (
+                old_section.get("definitions", []) if isinstance(old_section, dict) else []
+            )
+            if not isinstance(old_definitions, list):
+                old_definitions = []
+
+            # Names key the poller's reading/interval caches; types may repeat,
+            # but names must remain unique across all configured sensors.
+            names = set()
+            origins = set()
+            for i, defn in enumerate(definitions):
+                if not isinstance(defn, dict):
+                    return self._error(f"definitions[{i}] must be an object")
+                original_name = defn.pop("_original_name", None)
+                if original_name is not None:
+                    origin = (str(defn.get("type")), original_name)
+                    if not isinstance(original_name, str) or origin in origins:
+                        return self._error(f"definitions[{i}] has an invalid sensor origin")
+                    origins.add(origin)
+                if "type" not in defn:
+                    return self._error(f"definitions[{i}] missing required 'type' field")
+                if "name" not in defn:
+                    return self._error(f"definitions[{i}] missing required 'name' field")
+                name = defn["name"]
+                if not isinstance(name, str) or not name.strip():
+                    return self._error(f"definitions[{i}] name must be a nonempty string")
+                if name in names:
+                    return self._error(f"Duplicate sensor name: {name}")
+                names.add(name)
+                # Preserve masked credentials by stable sensor identity, not list position.
+                settings = defn.get("settings")
+                if isinstance(settings, dict) and settings.get("password") == "*****":
+                    lookup_name = original_name if original_name is not None else defn["name"]
+                    matches = [
+                        old
+                        for old in old_definitions
+                        if isinstance(old, dict)
+                        and old.get("name") == lookup_name
+                        and old.get("type") == defn["type"]
+                        and isinstance(old.get("settings"), dict)
+                    ]
+                    if not matches and original_name is None:
+                        # Legacy clients without an origin can rename only when
+                        # this type is unique on both sides.
+                        old_same_type = [
+                            old
+                            for old in old_definitions
+                            if isinstance(old, dict)
+                            and old.get("type") == defn["type"]
+                            and isinstance(old.get("settings"), dict)
+                        ]
+                        new_same_type = [
+                            new
+                            for new in definitions
+                            if isinstance(new, dict) and new.get("type") == defn["type"]
+                        ]
+                        if len(old_same_type) == len(new_same_type) == 1:
+                            matches = old_same_type
+                    if len(matches) != 1 or not matches[0]["settings"].get("password"):
+                        return self._error(f"definitions[{i}] cannot preserve password")
+                    settings["password"] = matches[0]["settings"]["password"]
+
+            sensors_section["definitions"] = definitions
+
+            # ConfigManager stages and fsyncs a private file, preserving the
+            # existing ownership/mode and symlink target before atomic replace.
+            # Keep legacy sensor type aliases unchanged (normal modem config
+            # persistence rewrites these aliases).
+            from repeater.config_manager import ConfigManager
+
+            config_yaml["sensors"] = sensors_section
+            if not ConfigManager(self._config_path, config_yaml)._persist_config(
+                config_yaml, normalize_modem=False
+            ):
+                return self._error("Failed to save sensor configuration")
+
+            # Publish only after persistence succeeds. Keep section references held
+            # by other daemon components stable.
+            if isinstance(self.config.get("sensors"), dict):
+                self.config["sensors"].clear()
+                self.config["sensors"].update(sensors_section)
+            else:
+                self.config["sensors"] = sensors_section
+
+            logger.info("Sensor configuration updated and saved to %s", self._config_path)
+            return self._success(
+                {
+                    "saved": True,
+                    "restart_required": True,
+                    "message": "Sensor configuration saved. A restart is required to apply changes.",
+                }
+            )
+        except cherrypy.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating sensor config: {e}", exc_info=True)
+            return self._error(str(e))
+
+    @cherrypy.expose
+    @cherrypy.tools.json_out()
+    def sensors_read(self):
+        """Trigger a one-shot read of all configured sensors and return results.
+
+        POST /api/sensors/read
+        """
+        try:
+            from repeater.sensors.manager import SensorManager
+
+            manager = SensorManager(self.config)
+            readings = manager.read_all()
+            summary = manager.get_summary()
+
+            return self._success(
+                {
+                    "readings": readings,
+                    "summary": {
+                        "enabled": summary["enabled"],
+                        "poll_interval_seconds": summary["poll_interval_seconds"],
+                        "configured": summary["configured"],
+                        "loaded": summary["loaded"],
+                        "running": summary["running"],
+                    },
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error reading sensors: {e}", exc_info=True)
+            return self._error(str(e))
+
     # ======================
     # OpenAPI Documentation
     # ======================

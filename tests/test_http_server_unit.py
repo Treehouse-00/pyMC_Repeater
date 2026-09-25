@@ -126,10 +126,30 @@ def test_stats_app_index_and_default_routing(monkeypatch, tmp_path):
     monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
     with pytest.raises(cherrypy.NotFound):
         app.default("api")
+    with pytest.raises(cherrypy.NotFound):
+        app.default("api", "unknown")
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="OPTIONS"), raising=False)
+    with pytest.raises(cherrypy.NotFound):
+        app.default("api")
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
 
     assert app.default("ws", "packets") == ""
     assert app.default("plugins") == "<html>ok</html>"
     assert app.default("route") == "<html>ok</html>"
+
+
+def test_root_sensor_api_aliases_are_not_exposed(monkeypatch, tmp_path):
+    (tmp_path / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+    fake_api = SimpleNamespace(config_manager=object(), docs=lambda: "d")
+    monkeypatch.setattr(hs, "APIEndpoints", lambda *args, **kwargs: fake_api)
+    app = hs.StatsApp(config={"web": {"web_path": str(tmp_path)}})
+    monkeypatch.setattr(cherrypy, "request", SimpleNamespace(method="GET"), raising=False)
+
+    for name in ("sensors_config", "sensors_config_update", "sensors_types", "sensors_read"):
+        assert not hasattr(app, name)
+        with pytest.raises(cherrypy.NotFound):
+            app.default(name)
+    assert app.default("sensors") == "<html>ok</html>"
 
 
 def test_stats_app_exposes_compiled_ui_favicon(monkeypatch, tmp_path):

@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import sys
+import types
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from repeater.config import (
     NullRadio,
     _apply_fabric_tx_mode,
+    _describe_radio_config,
     _merge_radio_entry,
+    build_metering_profiles,
     build_radio_stack,
     fabric_selects_by_ingress_radio,
 )
@@ -67,24 +71,169 @@ class _FakeRadio:
         return 5.0
 
 
-def test_merge_radio_entry_inherits_and_overrides():
+def test_merge_radio_entry_overlays_radio_sections():
+    """A partial entry section inherits the top-level keys it omits."""
     global_cfg = {
         "radio_type": "sx1262",
-        "radio": {"frequency": 1, "tx_power": 10},
-        "sx1262": {"bus_id": 0},
+        "radio": {
+            "frequency": 869618000,
+            "tx_power": 10,
+            "bandwidth": 62500,
+            "spreading_factor": 8,
+            "coding_rate": 8,
+        },
+        "sx1262": {
+            "bus_id": 0,
+            "cs_id": 0,
+            "use_dio3_tcxo": True,
+            "dio3_tcxo_voltage": 1.8,
+            "use_dio2_rf": True,
+            "en_pins": [12, 13],
+        },
+    }
+    entry = {
+        "id": "local",
+        "radio": {
+            "frequency": 910525000,
+            "tx_power": 22,
+        },
+        "sx1262": {
+            "cs_id": 1,
+            "reset_pin": 24,
+        },
+    }
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["_radio_id"] == "local"
+    assert merged["radio_type"] == "sx1262"
+
+    assert merged["radio"]["frequency"] == 910525000
+    assert merged["radio"]["tx_power"] == 22
+    assert merged["radio"]["bandwidth"] == 62500
+    assert merged["radio"]["spreading_factor"] == 8
+    assert merged["radio"]["coding_rate"] == 8
+
+    assert merged["sx1262"]["cs_id"] == 1
+    assert merged["sx1262"]["reset_pin"] == 24
+    assert merged["sx1262"]["bus_id"] == 0
+    assert merged["sx1262"]["use_dio3_tcxo"] is True
+    assert merged["sx1262"]["dio3_tcxo_voltage"] == 1.8
+    assert merged["sx1262"]["use_dio2_rf"] is True
+    assert merged["sx1262"]["en_pins"] == [12, 13]
+
+
+def test_merge_radio_entry_inherits_sx1262_tcxo_and_power_settings():
+    """RAK6421/RAK1330x regression: pin-only entry keeps TCXO/RF-switch setup."""
+    global_cfg = {
+        "radio_type": "sx1262",
+        "radio": {
+            "frequency": 910525000,
+            "tx_power": 22,
+        },
+        "sx1262": {
+            "bus_id": 0,
+            "cs_id": 0,
+            "cs_pin": -1,
+            "reset_pin": 16,
+            "busy_pin": 24,
+            "irq_pin": 22,
+            "txen_pin": -1,
+            "rxen_pin": -1,
+            "en_pins": [12, 13],
+            "use_dio2_rf": True,
+            "use_dio3_tcxo": True,
+            "dio3_tcxo_voltage": 1.8,
+        },
+    }
+    entry = {
+        "id": "local",
+        "sx1262": {
+            "bus_id": 0,
+            "cs_id": 0,
+            "cs_pin": -1,
+            "reset_pin": 16,
+            "busy_pin": 24,
+            "irq_pin": 22,
+            "txen_pin": -1,
+            "rxen_pin": -1,
+        },
+    }
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["sx1262"]["use_dio3_tcxo"] is True
+    assert merged["sx1262"]["dio3_tcxo_voltage"] == 1.8
+    assert merged["sx1262"]["use_dio2_rf"] is True
+    assert merged["sx1262"]["en_pins"] == [12, 13]
+
+
+def test_merge_radio_entry_explicit_false_overrides_inherited_true():
+    """Presence, not truthiness, decides whether an entry value overrides."""
+    global_cfg = {
+        "radio_type": "sx1262",
+        "sx1262": {
+            "use_dio3_tcxo": True,
+            "use_dio2_rf": True,
+            "is_waveshare": True,
+        },
     }
     entry = {
         "id": "link",
-        "radio_type": "modem_usb",
-        "radio": {"frequency": 2, "tx_power": 22},
-        "modem_usb": {"port": "/dev/ttyACM0"},
+        "sx1262": {
+            "use_dio3_tcxo": False,
+            "use_dio2_rf": False,
+            "is_waveshare": False,
+        },
     }
+
     merged = _merge_radio_entry(global_cfg, entry)
-    assert merged["_radio_id"] == "link"
+
+    assert merged["sx1262"]["use_dio3_tcxo"] is False
+    assert merged["sx1262"]["use_dio2_rf"] is False
+    assert merged["sx1262"]["is_waveshare"] is False
+
+
+def test_merge_radio_entry_can_override_radio_type():
+    global_cfg = {
+        "radio_type": "sx1262",
+        "radio": {
+            "frequency": 910525000,
+            "bandwidth": 62500,
+        },
+        "sx1262": {
+            "bus_id": 0,
+        },
+    }
+    entry = {
+        "id": "backhaul",
+        "radio_type": "modem_usb",
+        "modem_usb": {
+            "port": "/dev/ttyACM0",
+        },
+    }
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
     assert merged["radio_type"] == "modem_usb"
-    assert merged["radio"]["frequency"] == 2
     assert merged["modem_usb"]["port"] == "/dev/ttyACM0"
+    assert merged["radio"]["frequency"] == 910525000
     assert "sx1262" in merged  # inherited leftover ok; factory uses radio_type
+
+
+def test_merge_radio_entry_non_mapping_section_replaces_base():
+    global_cfg = {
+        "radio_type": "sx1262",
+        "sx1262": {"use_dio3_tcxo": True},
+    }
+    entry = {
+        "id": "local",
+        "sx1262": None,
+    }
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["sx1262"] is None
 
 
 def test_build_radio_stack_legacy_single():
@@ -373,20 +522,38 @@ def test_origin_tx_conflicting_with_former_name_rejected():
     factory.assert_not_called()
 
 
-def test_merge_radio_entry_preserves_per_radio_ch341():
+def test_merge_radio_entry_overlays_per_radio_ch341_selection():
+    """Shared adapter parameters stay global; only device identity differs."""
     global_cfg = {
         "radio_type": "sx1262_ch341",
-        "ch341": {"vid": 0x1A86, "pid": 0x5512, "bus": 1, "address": 5},
-        "radio": {"frequency": 1},
+        "ch341": {
+            "vid": 0x1A86,
+            "pid": 0x5512,
+            "bus": 1,
+            "address": 5,
+        },
+        "radio": {"frequency": 869618000},
         "sx1262": {"bus_id": 0},
     }
     entry = {
         "id": "link",
-        "ch341": {"vid": 0x1A86, "pid": 0x5512, "bus": 1, "address": 8},
-        "radio": {"frequency": 2},
+        "ch341": {
+            "address": 8,
+        },
+        "radio": {
+            "frequency": 864200000,
+        },
     }
+
     merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["ch341"]["vid"] == 0x1A86
+    assert merged["ch341"]["pid"] == 0x5512
+    assert merged["ch341"]["bus"] == 1
     assert merged["ch341"]["address"] == 8
+
+    assert merged["radio"]["frequency"] == 864200000
+
     assert merged["_ch341_per_instance"] is True
 
 
@@ -452,3 +619,290 @@ def test_a_current_core_is_given_the_selector_that_routes_by_ingress_radio():
     assert fabric.resolve_tx_radio_id(b"frame", rx_radio_id="link") == "local"
     # Originated here, so there is no side of the bridge to come from.
     assert fabric.resolve_tx_radio_id(b"frame") == "local"
+
+
+def test_build_radio_stack_multi_inherits_top_level_hardware_defaults():
+    """End-to-end: a partial radios[] entry reaches the radio factory complete."""
+    seen = []
+
+    def fake_get(board):
+        seen.append(dict(board))
+        return _FakeRadio(str(len(seen)))
+
+    cfg = {
+        "radio_type": "sx1262",
+        "sx1262": {
+            "bus_id": 0,
+            "cs_id": 0,
+            "cs_pin": -1,
+            "reset_pin": 16,
+            "busy_pin": 24,
+            "irq_pin": 22,
+            "txen_pin": -1,
+            "rxen_pin": -1,
+            "en_pins": [12, 13],
+            "use_dio3_tcxo": True,
+            "dio3_tcxo_voltage": 1.8,
+            "use_dio2_rf": True,
+        },
+        "radios": [
+            {
+                "id": "local",
+                "radio": {"frequency": 910525000},
+                "sx1262": {"cs_id": 0, "reset_pin": 16, "busy_pin": 24, "irq_pin": 22},
+            },
+            {
+                "id": "remote",
+                "radio_type": "modem_tcp",
+                "modem_tcp": {"host": "remote-radio.local"},
+            },
+        ],
+    }
+
+    with patch("repeater.config.get_radio_for_board", side_effect=fake_get):
+        _radio, meta = build_radio_stack(cfg)
+
+    assert meta["radio_ids"] == ["local", "remote"]
+
+    local, remote = seen
+    assert local["radio_type"] == "sx1262"
+    assert local["sx1262"]["en_pins"] == [12, 13]
+    assert local["sx1262"]["use_dio3_tcxo"] is True
+    assert local["sx1262"]["dio3_tcxo_voltage"] == 1.8
+    assert local["sx1262"]["use_dio2_rf"] is True
+    assert local["radio"]["frequency"] == 910525000
+
+    assert remote["radio_type"] == "modem_tcp"
+    assert remote["modem_tcp"]["host"] == "remote-radio.local"
+
+
+def test_merge_radio_entry_does_not_mutate_global_config():
+    global_cfg = {
+        "radio_type": "sx1262",
+        "sx1262": {"bus_id": 0, "use_dio3_tcxo": True},
+    }
+    entry = {"id": "link", "sx1262": {"cs_id": 1}}
+
+    _merge_radio_entry(global_cfg, entry)
+
+    assert global_cfg["sx1262"] == {"bus_id": 0, "use_dio3_tcxo": True}
+    assert entry["sx1262"] == {"cs_id": 1}
+
+
+def test_merge_radio_entry_entry_en_pin_displaces_inherited_en_pins():
+    """en_pins beats en_pin in SX1262Radio, so an inherited en_pins must not
+    shadow the single pin this entry asked for."""
+    global_cfg = {
+        "radio_type": "sx1262",
+        "sx1262": {"bus_id": 0, "en_pins": [12, 13]},
+    }
+    entry = {"id": "link", "sx1262": {"en_pin": 26}}
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["sx1262"]["en_pin"] == 26
+    assert "en_pins" not in merged["sx1262"]
+    assert merged["sx1262"]["bus_id"] == 0  # unrelated keys still inherited
+
+
+def test_merge_radio_entry_entry_en_pins_displaces_inherited_en_pin():
+    global_cfg = {
+        "radio_type": "sx1262",
+        "sx1262": {"bus_id": 0, "en_pin": 26},
+    }
+    entry = {"id": "link", "sx1262": {"en_pins": [12, 13]}}
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["sx1262"]["en_pins"] == [12, 13]
+    assert "en_pin" not in merged["sx1262"]
+
+
+@pytest.mark.parametrize(
+    "inherited_key, entry_key",
+    [
+        ("address", "device_address"),
+        ("device_address", "address"),
+    ],
+)
+def test_merge_radio_entry_ch341_address_spelling_displaces_the_other(inherited_key, entry_key):
+    """get_radio_for_board reads address before device_address, so whichever
+    spelling the entry uses has to displace the inherited one -- otherwise an
+    inherited address silently selects the wrong USB adapter."""
+    global_cfg = {
+        "radio_type": "sx1262_ch341",
+        "ch341": {"vid": 0x1A86, "pid": 0x5512, "bus": 1, inherited_key: 5},
+    }
+    entry = {"id": "link", "ch341": {entry_key: 8}}
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["ch341"][entry_key] == 8
+    assert inherited_key not in merged["ch341"]
+    assert merged["ch341"]["bus"] == 1  # unrelated keys still inherited
+
+
+@pytest.mark.parametrize(
+    "inherited_key, entry_key",
+    [
+        ("serial_number", "serial"),
+        ("serial", "serial_number"),
+    ],
+)
+def test_merge_radio_entry_ch341_serial_spelling_displaces_the_other(inherited_key, entry_key):
+    """A truthy serial_number wins over serial downstream, so an inherited one
+    would outrank the entry's choice whichever name the entry used."""
+    global_cfg = {
+        "radio_type": "sx1262_ch341",
+        "ch341": {"vid": 0x1A86, inherited_key: "AAA111"},
+    }
+    entry = {"id": "link", "ch341": {entry_key: "BBB222"}}
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["ch341"][entry_key] == "BBB222"
+    assert inherited_key not in merged["ch341"]
+
+
+@pytest.mark.parametrize("cleared", [0, None, ""])
+def test_merge_radio_entry_ch341_falsy_entry_value_still_displaces(cleared):
+    """Displacement is presence-based. An entry clearing its adapter selector
+    must not have the inherited one reinstated under the other spelling."""
+    global_cfg = {
+        "radio_type": "sx1262_ch341",
+        "ch341": {"vid": 0x1A86, "address": 5, "serial_number": "AAA111"},
+    }
+    entry = {"id": "link", "ch341": {"device_address": cleared}}
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["ch341"]["device_address"] == cleared
+    assert "address" not in merged["ch341"]
+    # A different alias group is untouched by this entry, so it still inherits.
+    assert merged["ch341"]["serial_number"] == "AAA111"
+
+
+def test_merge_radio_entry_ch341_entry_naming_both_spellings_is_left_alone():
+    """Both spellings in one entry is a pre-existing accepted configuration.
+    The merge must not rewrite or reject it -- get_radio_for_board's own
+    precedence (address before device_address) still decides."""
+    global_cfg = {
+        "radio_type": "sx1262_ch341",
+        "ch341": {"vid": 0x1A86, "address": 5, "device_address": 6},
+    }
+    entry = {"id": "link", "ch341": {"address": 8, "device_address": 9}}
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["ch341"]["address"] == 8
+    assert merged["ch341"]["device_address"] == 9
+    assert merged["ch341"]["vid"] == 0x1A86
+
+
+def test_merge_radio_entry_keeps_inherited_alias_when_entry_names_neither():
+    """The alias guard only fires when the entry actually picks a spelling."""
+    global_cfg = {
+        "radio_type": "sx1262",
+        "sx1262": {"en_pins": [12, 13], "bus_id": 0},
+    }
+    entry = {"id": "link", "sx1262": {"cs_id": 1}}
+
+    merged = _merge_radio_entry(global_cfg, entry)
+
+    assert merged["sx1262"]["en_pins"] == [12, 13]
+
+
+def test_metering_profile_inherits_top_level_air_settings():
+    """A partial radios[] air block used to meter on library defaults rather
+    than on the node's own top-level radio settings."""
+    cfg = {
+        "radio_type": "sx1262",
+        "radio": {
+            "frequency": 906875000,
+            "bandwidth": 250000,
+            "spreading_factor": 10,
+            "coding_rate": 5,
+            "preamble_length": 16,
+            "tx_power": 22,
+        },
+        "sx1262": {"bus_id": 0},
+        "radios": [{"id": "local", "radio": {"frequency": 910525000}}],
+    }
+
+    (profile,) = build_metering_profiles(cfg)
+
+    assert profile["radio_id"] == "local"
+    assert profile["frequency_hz"] == 910525000
+    assert profile["bandwidth_hz"] == 250000
+    assert profile["spreading_factor"] == 10
+    assert profile["coding_rate"] == 5
+    assert profile["tx_power"] == 22
+
+
+def test_describe_radio_config_redacts_modem_token():
+    board = {
+        "radio_type": "modem_tcp",
+        "radio": {"frequency": 910525000},
+        "modem_tcp": {"host": "remote.local", "token": "s3cret-value"},
+    }
+
+    described = _describe_radio_config(board)
+
+    assert "s3cret-value" not in described
+    assert "***" in described
+    assert "remote.local" in described
+    assert "type='modem_tcp'" in described
+    # The live config keeps its token; only the log copy is redacted.
+    assert board["modem_tcp"]["token"] == "s3cret-value"
+
+
+def test_ch341_alias_displacement_reaches_the_usb_transport():
+    """The merge-level tests above pin the dict; this pins the consequence.
+
+    get_radio_for_board selects the adapter with
+    ``ch341.get("address", ch341.get("device_address"))``, so without
+    displacement an inherited ``address`` would open a different physical
+    adapter than the entry asked for, on a node with two CH341 sticks.
+    """
+    ch341_module = types.ModuleType("openhop_core.hardware.transports.ch341_spi_transport")
+    ch341_module.CH341SPITransport = MagicMock(name="CH341SPITransport")
+
+    config = {
+        "radio_type": "sx1262_ch341",
+        "ch341": {"vid": 0x1A86, "pid": 0x5512, "bus": 1, "address": 5},
+        "radio": {
+            "frequency": 869618000,
+            "tx_power": 14,
+            "bandwidth": 62500,
+            "spreading_factor": 8,
+            "coding_rate": 8,
+            "preamble_length": 32,
+        },
+        "sx1262": {
+            "bus_id": 0,
+            "cs_id": 0,
+            "cs_pin": 0,
+            "reset_pin": 1,
+            "busy_pin": 2,
+            "irq_pin": 3,
+            "txen_pin": -1,
+            "rxen_pin": -1,
+        },
+        "radios": [{"id": "link", "ch341": {"device_address": 8}}],
+    }
+
+    with patch.dict(
+        sys.modules,
+        {"openhop_core.hardware.transports.ch341_spi_transport": ch341_module},
+    ):
+        with patch("openhop_core.hardware.sx1262_wrapper.SX1262Radio"):
+            with patch("openhop_core.hardware.lora.LoRaRF.SX126x.set_spi_transport") as set_spi:
+                build_radio_stack(config)
+
+    (call,) = ch341_module.CH341SPITransport.call_args_list
+    assert call.kwargs["address"] == 8  # the entry's adapter, not the inherited 5
+    assert call.kwargs["bus"] == 1  # still inherited
+    assert call.kwargs["vid"] == 0x1A86
+    # Multi-radio must not install the process-global SPI transport.
+    set_spi.assert_not_called()
+    assert call.kwargs["set_as_global_gpio"] is False

@@ -6,6 +6,8 @@ each client connection, which silently unsubscribed the SSE stream for the rest
 of the daemon's life.
 """
 
+import json
+
 import pytest
 from openhop_core.companion import CompanionBridge
 from openhop_core.companion.frame_server import CompanionFrameServer
@@ -22,7 +24,7 @@ def _endpoints(bridge):
     from repeater.web.companion_endpoints import CompanionAPIEndpoints
 
     ep = CompanionAPIEndpoints.__new__(CompanionAPIEndpoints)
-    ep._sse_callbacks = []
+    ep._sse_callbacks = {}
     ep._get_bridge = lambda **kw: bridge
     ep.broadcasts = []
     ep._broadcast_sse = ep.broadcasts.append
@@ -108,6 +110,26 @@ async def test_a_full_clear_is_repaired_on_the_next_stream_open(bridge):
     assert len(ep.broadcasts) == 1
 
 
+@pytest.mark.asyncio
+async def test_a_stream_that_falls_behind_ends_so_the_client_reconnects(bridge):
+    """Dropped for overflowing, a stream must end rather than send keepalives forever."""
+    from repeater.web.companion_endpoints import CompanionAPIEndpoints
+
+    ep = CompanionAPIEndpoints()
+    ep._sse_keepalive_sec = 0
+    ep._get_bridge = lambda **kw: bridge
+    stream = ep.events()
+    next(stream)
+
+    for _ in range(ep._sse_queue_maxsize + 1):
+        await bridge._fire_callbacks("advert_received", "contact")
+
+    for _ in range(ep._sse_queue_maxsize):
+        assert next(stream).startswith("data: ")
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
 def test_no_bridge_yet_leaves_registration_pending():
     """Called before any companion is loaded, it must stay retryable."""
     import cherrypy
@@ -115,12 +137,34 @@ def test_no_bridge_yet_leaves_registration_pending():
     from repeater.web.companion_endpoints import CompanionAPIEndpoints
 
     ep = CompanionAPIEndpoints.__new__(CompanionAPIEndpoints)
-    ep._sse_callbacks = []
+    ep._sse_callbacks = {}
 
     def _no_bridge(**kwargs):
         raise cherrypy.HTTPError(503, "No companion bridges configured")
 
     ep._get_bridge = _no_bridge
-    ep._ensure_callbacks()
+    with pytest.raises(cherrypy.HTTPError):
+        ep._ensure_callbacks()
 
-    assert ep._sse_callbacks == []
+    assert ep._sse_callbacks == {}
+
+
+@pytest.mark.asyncio
+async def test_a_stream_follows_the_companion_it_names():
+    """``companion_name`` picks the stream's companion; the default stays the first."""
+    from repeater.web.companion_endpoints import CompanionAPIEndpoints
+
+    first = CompanionBridge(LocalIdentity(seed=bytes.fromhex("aa" * 32)), _Injector())
+    second = CompanionBridge(LocalIdentity(seed=bytes.fromhex("bb" * 32)), _Injector())
+    ep = CompanionAPIEndpoints()
+    ep._sse_keepalive_sec = 0
+    ep._get_bridge = lambda name=None, **kw: second if name == "second" else first
+    default, named = ep.events(), ep.events(companion_name="second")
+    second_hash = f"0x{second.get_public_key()[0]:02X}"
+    next(default)
+    assert json.loads(next(named).removeprefix("data: "))["companion_hash"] == second_hash
+
+    await second._fire_callbacks("advert_received", "contact")
+
+    assert next(default) == ": keepalive\n\n"
+    assert json.loads(next(named).removeprefix("data: "))["companion_hash"] == second_hash

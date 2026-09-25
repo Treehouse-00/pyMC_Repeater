@@ -11,13 +11,19 @@ Single-radio nodes must publish exactly what they published before any of this
 existed.
 """
 
+import copy
 import json
 import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from repeater.config import build_radio_status_entries, get_node_info, get_radio_for_board
+from repeater.config import (
+    build_radio_status_entries,
+    capture_radio_status_baseline,
+    get_node_info,
+    get_radio_for_board,
+)
 from repeater.data_acquisition.mqtt_handler import MeshCoreToMqttPusher
 from repeater.data_acquisition.storage_utils import PacketRecord
 
@@ -454,3 +460,193 @@ def test_collector_omits_radio_ids_on_a_single_radio_node(tmp_path):
 
     assert "rx_radio_id" not in payload
     assert "tx_radio_ids" not in payload
+
+
+# --------------------------------------------------------------------
+# A live save must not move a radio that was not retuned
+# --------------------------------------------------------------------
+def test_applied_map_holds_non_default_radios_across_a_live_edit():
+    """Entries inherit the top-level radio block key by key, so editing the
+    default radio changes what a partial entry is *configured* with. Only the
+    default radio is actually retuned, so the rest must keep reporting the band
+    they are still transmitting on."""
+    config = {
+        "radio_type": "sx1262",
+        "radio": {
+            "frequency": 869618000,
+            "bandwidth": 62500,
+            "spreading_factor": 8,
+            "coding_rate": 8,
+            "preamble_length": 32,
+        },
+        "fabric": {"default_radio": "local"},
+        "radios": [
+            {"id": "local", "radio": {"frequency": 869618000}},
+            # Omits bandwidth/SF/CR, so it inherits them.
+            {"id": "link", "radio": {"frequency": 864200000}},
+        ],
+    }
+
+    applied = {entry["id"]: entry for entry in build_radio_status_entries(config)}
+    assert applied["link"]["radio"] == "864.2,62.5,8,8"
+
+    # What api_endpoints._set_radio_param does for the default radio: write the
+    # target entry, and mirror it into the legacy top-level block.
+    config["radios"][0]["radio"]["bandwidth"] = 500000
+    config["radio"]["bandwidth"] = 500000
+
+    entries = build_radio_status_entries(config, applied=applied)
+    by_id = {entry["id"]: entry for entry in entries}
+
+    assert by_id["local"]["radio"] == "869.618,500.0,8,8"  # really retuned
+    assert by_id["link"]["radio"] == "864.2,62.5,8,8"  # still on 62.5 kHz
+
+    # Without the applied map, link would follow the mirrored top-level value
+    # onto a band its hardware was never given -- the bug this guards.
+    naive = {e["id"]: e["radio"] for e in build_radio_status_entries(config)}
+    assert naive["link"] == "864.2,500.0,8,8"
+
+
+def test_applied_map_is_ignored_for_a_radio_the_config_has_just_added():
+    """A radio with no applied entry reports what it is configured with.
+
+    Adding a radio is restart-required, so until then it has no hardware on the
+    air at all and arguably should not be published. This pins the behaviour
+    that was already there -- the map has always been built from the current
+    radios[] list -- rather than endorsing it; fixing it means publishing the
+    boot topology, which is a change of its own.
+    """
+    config = {
+        "radio_type": "sx1262",
+        "radio": LOCAL_RADIO["radio"],
+        "fabric": {"default_radio": "local"},
+        "radios": [LOCAL_RADIO, LINK_RADIO],
+    }
+    applied = {"local": {"id": "local", "radio": "869.618,62.5,8,8"}}
+
+    entries = build_radio_status_entries(config, applied=applied)
+
+    assert entries[1] == {"id": "link", "radio": "864.2,62.5,11,8"}
+
+
+def test_no_applied_map_rebuilds_every_entry_from_config():
+    """A fresh start has nothing to preserve."""
+    config = {"radios": [LOCAL_RADIO, LINK_RADIO], "fabric": {"default_radio": "local"}}
+
+    assert build_radio_status_entries(config) == build_radio_status_entries(config, applied=None)
+
+
+def _publish_status_across_a_live_edit(config: dict, mutate) -> tuple:
+    """Two status publishes from one pusher, with a config edit between them."""
+    pusher = MeshCoreToMqttPusher(local_identity=_FakeIdentity("AB" * 32), config=config)
+    conn = pusher.connections[0]
+    captured = []
+    conn._running = True
+    conn.client = MagicMock()
+    conn.client.publish = lambda topic, payload, retain=False, qos=0: captured.append(payload)
+
+    pusher.publish_status(state="online")
+    mutate(config)
+    pusher.publish_status(state="online")
+
+    assert len(captured) == 2
+    return tuple(json.loads(payload) for payload in captured)
+
+
+def test_published_status_holds_a_non_retuned_radio_across_a_live_edit():
+    """The handler-level version of the same guarantee: an observer must not be
+    told a radio moved band when only the default radio was retuned."""
+    local = copy.deepcopy(LOCAL_RADIO)
+    config = _make_config(radios=[local, {"id": "link", "radio": {"frequency": 864200000}}])
+    config["radio"] = copy.deepcopy(LOCAL_RADIO["radio"])
+    config["fabric"]["default_radio"] = "local"
+
+    def widen_the_default_radio(cfg):
+        # Mirrors api_endpoints._set_radio_param for the default radio.
+        cfg["radios"][0]["radio"]["bandwidth"] = 500000
+        cfg["radio"]["bandwidth"] = 500000
+
+    first, second = _publish_status_across_a_live_edit(config, widen_the_default_radio)
+
+    assert {e["id"]: e["radio"] for e in first["radios"]} == {
+        "local": "869.618,62.5,8,8",
+        "link": "864.2,62.5,8,8",
+    }
+    assert {e["id"]: e["radio"] for e in second["radios"]} == {
+        "local": "869.618,500.0,8,8",  # retuned
+        "link": "864.2,62.5,8,8",  # untouched, still reported as it is
+    }
+
+
+def test_a_live_save_before_the_first_publish_does_not_poison_the_baseline():
+    """The first status publish waits for a broker to connect. A node whose MQTT
+    is briefly unreachable can take a radio save first, so a baseline captured
+    on that first publish would bake the pending settings in as though they were
+    what the hardware got."""
+    config = _make_config(
+        radios=[copy.deepcopy(LOCAL_RADIO), {"id": "link", "radio": {"frequency": 864200000}}]
+    )
+    config["radio"] = copy.deepcopy(LOCAL_RADIO["radio"])
+    config["fabric"]["default_radio"] = "local"
+
+    pusher = MeshCoreToMqttPusher(local_identity=_FakeIdentity("AB" * 32), config=config)
+
+    # The save lands while MQTT is still down, before any status was published.
+    config["radios"][0]["radio"]["bandwidth"] = 500000
+    config["radio"]["bandwidth"] = 500000
+
+    conn = pusher.connections[0]
+    captured = []
+    conn._running = True
+    conn.client = MagicMock()
+    conn.client.publish = lambda topic, payload, retain=False, qos=0: captured.append(payload)
+    pusher.publish_status(state="online")
+
+    by_id = {e["id"]: e["radio"] for e in json.loads(captured[0])["radios"]}
+    assert by_id["local"] == "869.618,500.0,8,8"  # really retuned
+    assert by_id["link"] == "864.2,62.5,8,8"  # never was
+
+
+def test_a_pending_default_radio_change_does_not_move_which_entry_is_refreshed():
+    """``fabric.default_radio`` is restart-required, so the running Fabric keeps
+    the default it booted with. Reading the default from live config would
+    refresh the radio that was not retuned and freeze the one that was --
+    reporting both wrongly, where rebuilding everything at least got one right.
+    """
+    config = {
+        "radio_type": "sx1262",
+        "radio": {
+            "frequency": 869618000,
+            "bandwidth": 62500,
+            "spreading_factor": 8,
+            "coding_rate": 8,
+            "preamble_length": 32,
+        },
+        "fabric": {"default_radio": "link"},
+        "radios": [
+            {"id": "local", "radio": {"frequency": 869618000}},
+            {"id": "link", "radio": {"frequency": 864200000}},
+        ],
+    }
+
+    applied, default_id = capture_radio_status_baseline(config)
+    assert default_id == "link"
+
+    # A save retunes the running default (link), and an import queues a change
+    # of default that only takes effect on restart.
+    config["radios"][1]["radio"]["bandwidth"] = 500000
+    config["radio"]["bandwidth"] = 500000
+    config["fabric"]["default_radio"] = "local"
+
+    by_id = {
+        e["id"]: e["radio"]
+        for e in build_radio_status_entries(config, applied=applied, default_radio_id=default_id)
+    }
+
+    assert by_id["link"] == "864.2,500.0,8,8"  # the radio that was retuned
+    assert by_id["local"] == "869.618,62.5,8,8"  # the radio that was not
+
+    # Following the pending default instead gets both radios wrong.
+    naive = {e["id"]: e["radio"] for e in build_radio_status_entries(config, applied=applied)}
+    assert naive["link"] == "864.2,62.5,8,8"
+    assert naive["local"] == "869.618,500.0,8,8"

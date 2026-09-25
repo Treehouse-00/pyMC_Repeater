@@ -3,7 +3,7 @@ import concurrent.futures
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from repeater.config import build_radio_profiles, resolve_storage_dir
 
@@ -122,6 +122,7 @@ class StorageCollector:
         # Wired by the daemon once the advert helper exists; returns the
         # rate-limit stats dict the sidebar's advert tier reads.
         self.advert_stats_getter = None
+        self.modem_status_getter: Callable[[], list[str]] | None = None
         self._last_noise_floor_dbm: Optional[float] = None
         self._stats_broadcast_seq = 0
         self._ws_stats_broadcast_interval_sec: float = 5.0
@@ -423,6 +424,8 @@ class StorageCollector:
             ),
             "mode": self.config.get("repeater", {}).get("mode", "forward"),
         }
+        if self.modem_status_getter is not None:
+            system_stats["modem_disconnected"] = self.modem_status_getter()
         airtime_stats = _node_airtime_stats(self.repeater_handler)
         if airtime_stats:
             system_stats["utilization_percent"] = airtime_stats["utilization_percent"]
