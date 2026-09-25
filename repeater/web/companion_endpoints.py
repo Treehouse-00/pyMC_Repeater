@@ -45,13 +45,13 @@ class CompanionAPIEndpoints:
         self._sse_queue_maxsize = max(32, int(http_cfg.get("sse_queue_maxsize", 64)))
         self._sse_keepalive_sec = max(5, int(http_cfg.get("sse_keepalive_sec", 15)))
 
-        # SSE clients: each gets a thread-safe queue
-        self._sse_clients: list[queue.Queue] = []
+        # SSE clients: each gets a thread-safe queue, mapped to its companion's hash
+        self._sse_clients: dict[queue.Queue, str] = {}
         self._sse_lock = threading.Lock()
 
-        # Built once, then re-asserted on every stream open (see
+        # Built once per companion, then re-asserted on every stream open (see
         # _ensure_callbacks). Kept stable so re-registering is a no-op.
-        self._sse_callbacks: list[tuple[str, Callable]] = []
+        self._sse_callbacks: dict[str, list[tuple[str, Callable]]] = {}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -176,25 +176,25 @@ class CompanionAPIEndpoints:
     # SSE push-event plumbing
     # ------------------------------------------------------------------
 
-    def _ensure_callbacks(self):
-        """Subscribe this stream's push callbacks on the bridge.
+    def _ensure_callbacks(self, **params) -> str:
+        """Subscribe this stream's push callbacks on its companion's bridge.
 
         Re-asserted on every stream open rather than latched after the first.
         Bridge registration is idempotent, so a repeat call costs nothing while
         a subscription that went missing — anything calling
         ``clear_push_callbacks`` — is repaired instead of leaving the stream
         silently dead until the daemon restarts. The callback objects are built
-        once and cached so they keep comparing equal across calls, which is what
-        makes the re-registration a no-op.
-        """
-        try:
-            bridge = self._get_bridge()
-        except cherrypy.HTTPError:
-            return  # bridge not yet available
+        once per companion and cached so they keep comparing equal across calls,
+        which is what makes the re-registration a no-op.
 
-        if not self._sse_callbacks:
-            self._sse_callbacks = [
-                (name, self._make_sse_callback(name))
+        Returns the companion's hash, which tags its events.
+        """
+        bridge = self._get_bridge(**params)
+        companion_hash = f"0x{bridge.get_public_key()[0]:02X}"
+
+        if companion_hash not in self._sse_callbacks:
+            self._sse_callbacks[companion_hash] = [
+                (name, self._make_sse_callback(name, companion_hash))
                 for name in (
                     "message_received",
                     "channel_message_received",
@@ -205,16 +205,18 @@ class CompanionAPIEndpoints:
                 )
             ]
 
-        for name, callback in self._sse_callbacks:
+        for name, callback in self._sse_callbacks[companion_hash]:
             register_fn = getattr(bridge, f"on_{name}", None)
             if register_fn:
                 register_fn(callback)
+        return companion_hash
 
-    def _make_sse_callback(self, event_name: str) -> Callable:
+    def _make_sse_callback(self, event_name: str, companion_hash: str) -> Callable:
         """Return a callback that serialises event data for SSE clients."""
 
         def _cb(*args, **kwargs):
             payload = self._serialise_event(event_name, args, kwargs)
+            payload["companion_hash"] = companion_hash
             self._broadcast_sse(payload)
 
         return _cb
@@ -230,16 +232,18 @@ class CompanionAPIEndpoints:
         return data
 
     def _broadcast_sse(self, payload: dict):
-        """Put *payload* into every active SSE client queue."""
+        """Put *payload* into the queue of every SSE client of its companion."""
         with self._sse_lock:
             dead = []
-            for q in self._sse_clients:
+            for q, companion_hash in self._sse_clients.items():
+                if companion_hash != payload["companion_hash"]:
+                    continue
                 try:
                     q.put_nowait(payload)
                 except queue.Full:
                     dead.append(q)
             for q in dead:
-                self._sse_clients.remove(q)
+                self._sse_clients.pop(q)
 
     # ==================================================================
     # REST Endpoints
@@ -696,8 +700,10 @@ class CompanionAPIEndpoints:
         Connect with ``EventSource('/api/companion/events?token=JWT')``.
         Auth is handled by the CherryPy tool-level require_auth (supports
         query-param JWT tokens needed by the browser EventSource API).
+        ``companion_name`` or ``companion_hash`` picks the companion, as on the
+        REST endpoints (default: the first); every event carries its hash.
         """
-        self._ensure_callbacks()
+        companion_hash = self._ensure_callbacks(**self._resolve_bridge_params(kwargs))
 
         cherrypy.response.headers["Content-Type"] = "text/event-stream"
         cherrypy.response.headers["Cache-Control"] = "no-cache"
@@ -706,11 +712,12 @@ class CompanionAPIEndpoints:
 
         client_queue: queue.Queue = queue.Queue(maxsize=self._sse_queue_maxsize)
         with self._sse_lock:
-            self._sse_clients.append(client_queue)
+            self._sse_clients[client_queue] = companion_hash
 
         def generate():
             try:
                 payload = {"event": "connected", "timestamp": int(time.time())}
+                payload["companion_hash"] = companion_hash
                 yield f"data: {json.dumps(payload)}\n\n"
 
                 while True:
@@ -730,7 +737,7 @@ class CompanionAPIEndpoints:
             finally:
                 with self._sse_lock:
                     if client_queue in self._sse_clients:
-                        self._sse_clients.remove(client_queue)
+                        self._sse_clients.pop(client_queue)
 
         return generate()
 
