@@ -108,6 +108,26 @@ async def test_a_full_clear_is_repaired_on_the_next_stream_open(bridge):
     assert len(ep.broadcasts) == 1
 
 
+@pytest.mark.asyncio
+async def test_a_stream_that_falls_behind_ends_so_the_client_reconnects(bridge):
+    """Dropped for overflowing, a stream must end rather than send keepalives forever."""
+    from repeater.web.companion_endpoints import CompanionAPIEndpoints
+
+    ep = CompanionAPIEndpoints()
+    ep._sse_keepalive_sec = 0
+    ep._get_bridge = lambda **kw: bridge
+    stream = ep.events()
+    next(stream)
+
+    for _ in range(ep._sse_queue_maxsize + 1):
+        await bridge._fire_callbacks("advert_received", "contact")
+
+    for _ in range(ep._sse_queue_maxsize):
+        assert next(stream).startswith("data: ")
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
 def test_no_bridge_yet_leaves_registration_pending():
     """Called before any companion is loaded, it must stay retryable."""
     import cherrypy
