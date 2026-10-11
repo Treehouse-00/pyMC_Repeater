@@ -13,10 +13,13 @@ from openhop_core.node.handlers.protocol_request import ProtocolRequestHandler
 from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
 from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.node.handlers.trace import TraceHandler
+from openhop_core.protocol import Packet
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_GRP_TXT,
     PH_ROUTE_MASK,
+    PH_TYPE_MASK,
+    PH_TYPE_SHIFT,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_TRANSPORT_DIRECT,
 )
@@ -60,6 +63,35 @@ def _is_direct_intermediate_hop(packet) -> bool:
     return route in (ROUTE_TYPE_DIRECT, ROUTE_TYPE_TRANSPORT_DIRECT) and not _is_direct_final_hop(
         packet
     )
+
+
+def _unwrap_multipart_ack(packet):
+    """Return the ACK carried by a MULTIPART ACK wrapper as its own packet, or None.
+
+    Mirrors MeshCore Mesh.cpp's PAYLOAD_TYPE_MULTIPART case: the inner packet keeps
+    the wrapper's route and path and drops the 1-byte remaining/type prefix. The
+    header's payload type is rewritten to ACK so companion bridges dispatch it to
+    their ACK handler; firmware skips that step only because it calls onAckRecv
+    directly.
+    """
+    payload = bytes(getattr(packet, "payload", b"") or b"")
+    if len(payload) < 5 or (payload[0] & 0x0F) != AckHandler.payload_type():
+        return None
+    inner = Packet()
+    inner.header = (packet.header & ~(PH_TYPE_MASK << PH_TYPE_SHIFT)) | (
+        AckHandler.payload_type() << PH_TYPE_SHIFT
+    )
+    inner.path_len = packet.path_len
+    inner.path = bytearray(packet.path)
+    inner.payload = bytearray(payload[1:])
+    inner.payload_len = len(inner.payload)
+    inner.transport_codes = list(packet.transport_codes)
+    inner._snr = getattr(packet, "_snr", 0)
+    inner._rssi = getattr(packet, "_rssi", 0)
+    inner._rx_radio_id = getattr(packet, "_rx_radio_id", None)
+    inner._injected_for_tx = getattr(packet, "_injected_for_tx", False)
+    inner._injected_origin_hash = getattr(packet, "_injected_origin_hash", None)
+    return inner
 
 
 def _is_expected_drop_reason(reason) -> bool:
@@ -607,6 +639,12 @@ class PacketRouter:
                 if len(getattr(packet, "payload", b"")) >= 4:
                     ack_crc = int.from_bytes(packet.payload[:4], "little")
                     await self._register_ack_with_dispatcher(ack_crc, "ACK")
+                    # Firmware calls onAckRecv here before checking whether this
+                    # node is the next hop, so a co-hosted companion that sent the
+                    # message is confirmed by the ACK it overhears on the way back.
+                    # Engine forwarding is unaffected.
+                    companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+                    await self._fan_out_to_bridges(packet, companion_bridges, context="ACK")
 
         # Route to specific handlers for parsing only
         elif payload_type == TraceHandler.payload_type():
@@ -693,12 +731,14 @@ class PacketRouter:
 
         elif payload_type == MultipartAckHandler.payload_type():
             # MULTIPART ACK wrapper: low nibble of first byte is embedded payload type.
-            if (
-                len(getattr(packet, "payload", b"")) >= 5
-                and (packet.payload[0] & 0x0F) == AckHandler.payload_type()
-            ):
-                ack_crc = int.from_bytes(packet.payload[1:5], "little")
+            # Bridges have no MULTIPART handler, so hand them the unwrapped ACK.
+            # Policy and origin exclusion are decided on the received wrapper.
+            inner_ack = _unwrap_multipart_ack(packet)
+            if inner_ack is not None:
+                ack_crc = int.from_bytes(inner_ack.payload[:4], "little")
                 await self._register_ack_with_dispatcher(ack_crc, "multi-ACK")
+                companion_bridges = self._companion_bridges_for_packet(packet, metadata)
+                await self._fan_out_to_bridges(inner_ack, companion_bridges, context="multi-ACK")
 
         elif payload_type == TextMessageHandler.payload_type():
             # Same one-byte dest-hash collision handling as the login path above:
