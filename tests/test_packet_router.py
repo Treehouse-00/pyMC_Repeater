@@ -21,7 +21,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from openhop_core.companion import CompanionBridge
+from openhop_core.companion import CompanionBridge, Contact
 from openhop_core.node.handlers.ack import AckHandler
 from openhop_core.node.handlers.advert import AdvertHandler
 from openhop_core.node.handlers.control import ControlHandler
@@ -38,6 +38,7 @@ from openhop_core.node.handlers.trace import TraceHandler
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_GRP_TXT,
+    PAYLOAD_TYPE_MULTIPART,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_DIRECT,
@@ -1165,8 +1166,8 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
                 bridge.process_received_packet.assert_awaited_once_with(packet)
                 daemon.repeater_handler.assert_not_awaited()
 
-    async def test_direct_intermediate_ack_notifies_waiter_without_companion_delivery(self):
-        """MeshCore's early ACK notification does not make an intermediate hop a recipient."""
+    async def test_direct_intermediate_ack_notifies_waiter_and_companions(self):
+        """MeshCore calls onAckRecv on an early-received direct ACK, then forwards it."""
         daemon = _make_daemon()
         bridge = _make_bridge()
         daemon.companion_bridges = {0x01: bridge}
@@ -1179,7 +1180,7 @@ class TestPacketRouterRoutingBranches(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(packet)
 
         daemon.dispatcher._register_ack_received.assert_awaited_once_with(0x95AFAB4D)
-        bridge.process_received_packet.assert_not_awaited()
+        bridge.process_received_packet.assert_awaited_once_with(packet)
         daemon.repeater_handler.assert_awaited_once()
 
     async def test_direct_intermediate_control_high_bit_is_released_without_local_delivery(self):
@@ -1541,3 +1542,133 @@ class TestCompanionDeliveryFailureHandling(unittest.IsolatedAsyncioTestCase):
         await router._route_packet(pkt)
 
         daemon.repeater_handler.assert_awaited_once()
+
+
+class TestCompanionAckConfirmation(unittest.IsolatedAsyncioTestCase):
+    """ACK shapes MeshCore passes to onAckRecv must confirm a real companion send.
+
+    Each case sends a DM from a real CompanionBridge so its ACK CRC is pending,
+    routes the ACK the firmware would accept, and checks send_confirmed fired.
+    """
+
+    async def _bridge_with_pending_send(self):
+        async def inject_packet(packet, wait_for_ack=False, expected_crc=None):
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), inject_packet, node_name="Sender")
+        peer = LocalIdentity().get_public_key()
+        bridge.add_update_contact(Contact(public_key=peer, name="Peer"))
+        result = await bridge.send_text_message(peer, "hello", wait_for_ack=False)
+        self.assertTrue(result.success)
+        self.assertNotEqual(result.expected_ack, 0)
+        confirmed = []
+
+        async def on_confirmed(crc, trip_ms):
+            confirmed.append(crc)
+
+        bridge.on_send_confirmed(on_confirmed)
+        return bridge, result.expected_ack, confirmed
+
+    @staticmethod
+    def _packet(payload_type, route_type, path, payload):
+        packet = Packet()
+        packet.header = (payload_type << 2) | route_type
+        packet.path = bytearray(path)
+        packet.path_len = len(path)
+        packet.payload = bytearray(payload)
+        packet.payload_len = len(payload)
+        return packet
+
+    async def _route(self, bridge, packet, policy_engine=None):
+        daemon = _make_daemon()
+        if policy_engine is not None:
+            daemon.repeater_handler.policy_engine = policy_engine
+        daemon.companion_bridges = {0x01: bridge}
+        router = PacketRouter(daemon)
+        await router._route_packet(packet)
+        return daemon
+
+    async def test_direct_ack_with_1_hop_left(self):
+        bridge, crc, confirmed = await self._bridge_with_pending_send()
+        # 6-byte firmware ACK: CRC (LE) + ext-attempt + random byte.
+        packet = self._packet(
+            AckHandler.payload_type(),
+            ROUTE_TYPE_DIRECT,
+            [0x42],
+            crc.to_bytes(4, "little") + b"\x00\x7f",
+        )
+
+        daemon = await self._route(bridge, packet)
+
+        self.assertEqual(confirmed, [crc])
+        daemon.dispatcher._register_ack_received.assert_awaited_once_with(crc)
+        daemon.repeater_handler.assert_awaited_once()  # still forwarded
+
+    async def test_multipart_ack_direct_final(self):
+        bridge, crc, confirmed = await self._bridge_with_pending_send()
+        # remaining=1 in the high nibble, embedded type ACK in the low nibble.
+        packet = self._packet(
+            PAYLOAD_TYPE_MULTIPART,
+            ROUTE_TYPE_DIRECT,
+            [],
+            bytes([(1 << 4) | AckHandler.payload_type()]) + crc.to_bytes(4, "little"),
+        )
+
+        daemon = await self._route(bridge, packet)
+
+        self.assertEqual(confirmed, [crc])
+        daemon.dispatcher._register_ack_received.assert_awaited_once_with(crc)
+
+    async def test_multipart_ack_flood(self):
+        bridge, crc, confirmed = await self._bridge_with_pending_send()
+        packet = self._packet(
+            PAYLOAD_TYPE_MULTIPART,
+            ROUTE_TYPE_FLOOD,
+            [0x11, 0x22],
+            bytes([AckHandler.payload_type()]) + crc.to_bytes(4, "little"),
+        )
+
+        daemon = await self._route(bridge, packet)
+
+        self.assertEqual(confirmed, [crc])
+        daemon.dispatcher._register_ack_received.assert_awaited_once_with(crc)
+
+    async def test_policy_drop_blocks_early_and_multipart_ack_confirmation(self):
+        drop_all = PolicyEngine({"enabled": True, "default_action": "drop", "rules": []})
+        cases = {
+            "direct ACK with 1 hop left": (
+                AckHandler.payload_type(),
+                ROUTE_TYPE_DIRECT,
+                [0x42],
+                lambda crc: crc.to_bytes(4, "little"),
+            ),
+            "MULTIPART ACK flood": (
+                PAYLOAD_TYPE_MULTIPART,
+                ROUTE_TYPE_FLOOD,
+                [0x11],
+                lambda crc: bytes([AckHandler.payload_type()]) + crc.to_bytes(4, "little"),
+            ),
+        }
+        for name, (ptype, route, path, build) in cases.items():
+            with self.subTest(name):
+                bridge, crc, confirmed = await self._bridge_with_pending_send()
+                packet = self._packet(ptype, route, path, build(crc))
+
+                await self._route(bridge, packet, policy_engine=drop_all)
+
+                self.assertEqual(confirmed, [])
+
+    async def test_multipart_ack_withheld_from_originating_companion(self):
+        bridge, crc, confirmed = await self._bridge_with_pending_send()
+        packet = self._packet(
+            PAYLOAD_TYPE_MULTIPART,
+            ROUTE_TYPE_DIRECT,
+            [],
+            bytes([AckHandler.payload_type()]) + crc.to_bytes(4, "little"),
+        )
+        packet._injected_for_tx = True
+        packet._injected_origin_hash = "0x01"
+
+        await self._route(bridge, packet)
+
+        self.assertEqual(confirmed, [])
