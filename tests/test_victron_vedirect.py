@@ -85,14 +85,14 @@ def manager(device="/dev/ttyUSB-test", **settings):
         ("VPV", "18600", "pv_voltage_v", 18.6),
         ("PPV", "234", "pv_power_w", 234),
         ("IL", "1500", "load_current_a", 1.5),
-        ("ERR", "17", "error_code", 17),
-        ("MPPT", "2", "tracker_state_code", 2),
+        ("ERR", "17", "error", "Charger temperature too high"),
+        ("MPPT", "2", "tracker_state", "MPP Tracker active"),
         ("HSDS", "364", "day_sequence", 364),
-        ("OR", "0x00000040", "off_reason", 64),
+        ("OR", "0x00000040", "off_reason", "BMS"),
         ("LOAD", "ON", "load_output", True),
         ("Relay", "Off", "relay", False),
         ("Alarm", "On", "alarm", True),
-        ("AR", "5", "alarm_reason", 5),
+        ("AR", "5", "alarm_reason", "Low Voltage; Low SOC"),
         ("VS", "12400", "aux_voltage_v", 12.4),
         ("VM", "6200", "midpoint_voltage_v", 6.2),
         ("DM", "15", "midpoint_deviation_percent", 1.5),
@@ -117,7 +117,7 @@ def manager(device="/dev/ttyUSB-test", **settings):
         ("H16", "14000", "max_aux_voltage_v", 14),
         ("H17", "123", "history_energy_h17_kwh", 1.23),
         ("H18", "234", "history_energy_h18_kwh", 2.34),
-        ("MON", "-9", "monitor_mode_code", -9),
+        ("MON", "-9", "monitor_mode", "Solar charger"),
         ("H19", "456", "yield_total_kwh", 4.56),
         ("H20", "12", "yield_today_kwh", 0.12),
         ("H21", "300", "max_power_today_w", 300),
@@ -185,18 +185,16 @@ def test_metrics_are_current_snapshot_not_stale(monkeypatch):
     monkeypatch.setattr(serial, "Serial", MagicMock(return_value=port))
     m = manager()
     first = m.read_all()[0]
-    voltage = next(x for x in first["metrics"] if x["data_key"] == "battery_voltage_v")
-    assert voltage["unit"] == "V" and voltage["kind"] == "number" and voltage["available"]
+    assert first["data"] == {"battery_voltage_v": 13.0, "pv_power_w": 25}
+    assert "metrics" not in first
     port.read.return_value = frame({"V": "---"})
     second = m.read_all()[0]
     assert second["data"] == {"battery_voltage_v": None}
-    assert {x["id"] for x in second["metrics"]} == {"/V", "/PPV"}
-    assert {x["reason"] for x in second["metrics"]} == {"invalid", "missing"}
-    assert all(not x["available"] for x in second["metrics"])
+    assert "metrics" not in second
     port.read.side_effect = OSError("synthetic-private-payload")
     failed = m.read_all()[0]
     assert failed["data"] == {} and not failed["ok"]
-    assert all(not x["available"] for x in failed["metrics"])
+    assert "metrics" not in failed
     assert "synthetic-private-payload" not in str(failed)
 
 
@@ -447,7 +445,7 @@ def test_manager_reads_normalized_battery_without_writing(monkeypatch):
         (999, "Unknown (999)"),
     ],
 )
-def test_manager_charge_state_label_preserves_code(monkeypatch, code, label):
+def test_manager_charge_state_is_decoded_for_existing_ui(monkeypatch, code, label):
     import serial
 
     port = MagicMock()
@@ -456,11 +454,8 @@ def test_manager_charge_state_label_preserves_code(monkeypatch, code, label):
     monkeypatch.setattr(serial, "Serial", MagicMock(return_value=port))
     reading = manager().read_all()[0]
     assert reading["ok"]
-    assert reading["data"] == {"charge_state_code": code}
-    descriptor = reading["metrics"][0]
-    assert descriptor["display_value"] == label
-    assert descriptor["label"] == "State of operation"
-    assert descriptor["kind"] == "number"
+    assert reading["data"] == {"charge_state": label}
+    assert "metrics" not in reading
 
 
 @pytest.mark.parametrize(

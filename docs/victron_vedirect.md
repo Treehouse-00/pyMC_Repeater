@@ -70,7 +70,7 @@ All complete validated blocks observed **during this poll only** are merged; the
 
 Read latency can consume the configured deadline even on success. Other sensors in the manager wait behind this poll, but it does not wait indefinitely for a controller. Multiple configured serial devices add their bounded acquisition times. This deadline bounds normal local serial acquisition, not pathological kernel/driver failure or the existing manager's scheduling interval.
 
-The standard envelope contains `name`, `type`, `ok`, `timestamp`, flat `data`, optional `error`, and `metrics`. A validated text block gives `ok: true` even if no supported measurement is present. No valid frame gives `ok: false` and empty data. A present invalid field is `null`; a missing field is omitted. `---` is unavailable, and `TTG=-1` means infinite, represented as unavailable rather than a fabricated numeric duration. Previously observed metric descriptors remain with `available: false` and `reason: missing`, `invalid`, or `read_failed`; their values are never retained. IDs such as `/VPV` are pointers into the parsed text field mapping, and `data_key` points to the normalized flat key. Descriptors use the existing number/boolean kind, category, nullable unit and availability contract; generic UI clients should honor `unit` rather than guess from labels. Older clients can still use flat values and unit-bearing keys.
+The standard envelope contains `name`, `type`, `ok`, `timestamp`, flat `data`, and optional `error`. A validated text block gives `ok: true` even if no supported measurement is present. No valid frame gives `ok: false` and empty data. A present invalid field is `null`; a missing field is omitted. `---` is unavailable, and `TTG=-1` means infinite, represented as unavailable rather than a fabricated numeric duration. No previous value or label is retained. This drop-in sensor deliberately omits metric descriptors and uses the existing UI's normal flat grid, which can render readable text without an application or UI upgrade.
 
 Only an explicit allowlist is published. Serial number (`SER#`), product/firmware strings, unknown labels, HEX payloads and raw frames are not returned or logged. Transport errors are deliberately sanitized.
 
@@ -82,9 +82,9 @@ Fields depend on model, firmware and configured auxiliary input. This table desc
 |---|---|---|
 | `V`, `I` | `battery_voltage_v`, `battery_current_a` | mV→V, mA→A; current sign preserved |
 | `VPV`, `PPV`, `IL` | `pv_voltage_v`, `pv_power_w`, `load_current_a` | mV→V, W, mA→A |
-| `CS`, `ERR`, `MPPT` | `charge_state_code`, `error_code`, `tracker_state_code` | Numeric protocol codes; no guessed model-specific interpretation |
+| `CS`, `ERR`, `MPPT` | `charge_state`, `error`, `tracker_state` | Readable official state/error/tracker descriptions |
 | `LOAD`, `Relay`, `Alarm` | `load_output`, `relay`, `alarm` | Case-insensitive ON/OFF→boolean; other values unavailable |
-| `AR`, `OR`, `MON` | `alarm_reason`, `off_reason`, `monitor_mode_code` | Decimal alarm mask, hexadecimal off mask, signed decimal DC monitor mode |
+| `AR`, `OR`, `MON` | `alarm_reason`, `off_reason`, `monitor_mode` | All active reason descriptions; readable signed DC monitor mode |
 | `VS`, `VM`, `DM` | `aux_voltage_v`, `midpoint_voltage_v`, `midpoint_deviation_percent` | mV→V, mV→V, per-mille→percent |
 | `T`, `P`, `CE`, `SOC`, `TTG` | `battery_temperature_c`, `battery_power_w`, `consumed_ah`, `state_of_charge_percent`, `time_to_go_minutes` | °C, W, mAh→Ah, per-mille→percent, minutes |
 | `H1`, `H2`, `H3`, `H6` | `deepest_discharge_ah`, `last_discharge_ah`, `average_discharge_ah`, `cumulative_drawn_ah` | mAh→Ah; signs preserved |
@@ -97,9 +97,9 @@ Fields depend on model, firmware and configured auxiliary input. This table desc
 
 `H17/H18` mean discharged/charged energy for a BMV, but produced/consumed energy in DC monitor mode; their keys intentionally avoid assigning a meaning that requires knowing the mode. `MON` is available only on supporting firmware. `SOC` outside 0–1000 per-mille and `HSDS` outside 0–364 are treated as invalid. Negative unsigned status codes/masks are invalid; `MON` remains signed.
 
-### Readable Status cards
+### Readable status values — sensor only
 
-Raw numeric codes and masks remain unchanged in flat `data` for API/storage consumers. The corresponding descriptor carries optional `display_value` text, rendered directly in the existing **Status** card by compatible RepeaterUI versions. There is no extra flat `charge_state` string or duplicate **Legacy values** entry. Older UIs safely retain numeric status rendering.
+Decode status codes and masks in the sensor itself and publish one readable value per field in flat `data`. There are no duplicate numeric status fields, descriptor-only labels, **Legacy values** section, UI dependency, or compatibility/version switch. Numeric measurements and counts remain numbers; LOAD/Relay/Alarm remain booleans. The status fields themselves are strings (or null when invalid), not raw numeric API codes.
 
 - `CS`: official state of operation (p. 15), e.g. `3` → **Bulk**.
 - `ERR`: official error code (p. 15), e.g. `0` → **No error**.
@@ -108,7 +108,7 @@ Raw numeric codes and masks remain unchanged in flat `data` for API/storage cons
 - `OR`: hexadecimal off-reason mask (p. 11), e.g. `0x9` → **No input power; Remote input**.
 - `AR`: decimal alarm-reason mask (p. 11), e.g. `5` → **Low Voltage; Low SOC**.
 
-Unknown enum values remain explicit as **Unknown (code)**. All active mask reasons are shown; unrecognized bits are appended as **Unknown bits (0xHEX)**, not silently discarded. A zero reason mask displays **None**, meaning no reason bits are set (not an inference about device health). Missing, invalid or failed readings omit `display_value` and show **n/a**, never the previous label. `day_sequence` remains numeric and LOAD/Relay/Alarm remain booleans. These interpretations follow the protocol, not a guessed physical model.
+Unknown enum values remain explicit as **Unknown (code)**. All active mask reasons are shown; unrecognized bits are appended as **Unknown bits (0xHEX)**, not silently discarded. A zero reason mask displays **None**, meaning no reason bits are set (not an inference about device health). Missing fields are omitted, invalid fields are null (rendered **n/a**), and a failed read returns empty data with an error, never the previous label. `day_sequence` remains numeric. These interpretations follow the protocol, not a guessed physical model.
 
 For MPPT 75/15 and 100/15, firmware 1.14 and earlier reports converter output current in `I`, not necessarily current into the battery. Protocol Table I footnote 5 documents the distinction. This plug-in preserves the reported current; confirm firmware before treating that key as battery current on older models.
 
@@ -123,8 +123,8 @@ Source: [Victron VE.Direct Protocol 3.34](https://www.victronenergy.com/upload/d
 | p. 5, **Message format**, **Data integrity**: CRLF/label/tab/value, binary single-byte Checksum, modulo-256 sum=0, multiple blocks | Incremental binary parser; all 256 checksum byte values, corruption/resync and multiple-block polling tests |
 | pp. 6–9, **Fields**, **Table I Supported Text-mode fields** | Explicit `FIELDS` conversion allowlist and parameterized real-manager normalization tests |
 | p. 6 footnotes 8–11; p. 7 footnote 12 | `---` invalid/unsynchronized/unsupported values and infinite `TTG=-1` tests |
-| pp. 10–11, **I**, **Alarm**, **Relay**, **AR**, **OR**; pp. 15–16, **CS**, **ERR**, **HSDS**, **MPPT**, **MON** | Preserve raw current sign and numeric states/masks; official descriptor display text for all enum values and mask bits, unknown codes/bits and multi-reason tests in `tests/test_victron_status.py`; case-insensitive flags; no fabricated model fields |
+| pp. 10–11, **I**, **Alarm**, **Relay**, **AR**, **OR**; pp. 15–16, **CS**, **ERR**, **HSDS**, **MPPT**, **MON** | Preserve current sign; sensor-local decoding for all enum values and mask bits, unknown codes/bits and multi-reason tests in `tests/test_victron_status.py`; case-insensitive flags; no fabricated model fields |
 | p. 17, **Implementation guidelines** | 8/32 character field payload bounds, 22 temporary data fields, validation before publication; bounded noise/malformed fixtures |
-| `SensorBase.read/_reading_metrics`, registry decorator, `SensorManager.reload/read_all`, `APIEndpoints.sensors_types`, OpenAPI `SensorMetricDescriptor` | Real manager and settings-discovery tests; no new lifecycle hooks; metadata conforms to the existing optional contract |
+| `SensorBase.read`, registry decorator, `SensorManager.reload/read_all`, `APIEndpoints.sensors_types` | Real manager and settings-discovery tests; existing flat envelope; no new lifecycle hooks or UI contract |
 
 All tests in `tests/test_victron_vedirect.py` are explicitly synthetic. PTYs exercise the real Linux/pyserial open/read/close path, fragmentation, timeout, disconnect/recovery and absence of transmitted serial data; they do **not** validate the friend's controller, cable, firmware or live values.

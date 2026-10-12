@@ -65,7 +65,6 @@ def reading(monkeypatch, fields):
     sensor = VictronVEDirectSensor("Synthetic", {"settings": {"serial_device": "/dev/synthetic"}})
 
     def acquire():
-        sensor._seen.update(fields)
         return normalize(fields)
 
     monkeypatch.setattr(sensor, "_read_serial", acquire)
@@ -80,20 +79,18 @@ def reading(monkeypatch, fields):
         for code, label in table.items()
     ],
 )
-def test_enum_descriptor_preserves_numeric_data(monkeypatch, field, code, label):
+def test_dropin_enums_are_readable_in_flat_data(monkeypatch, field, code, label):
     _, result = reading(monkeypatch, {field: str(code)})
-    descriptor = result["metrics"][0]
-    assert descriptor["display_value"] == label
-    assert result["data"] == {descriptor["data_key"]: code}
-    assert descriptor["category"] == "status"
-    assert descriptor["kind"] == "number"
+    key = {"ERR": "error", "MPPT": "tracker_state", "MON": "monitor_mode"}[field]
+    assert result["data"] == {key: label}
+    assert "metrics" not in result
 
 
 @pytest.mark.parametrize("field", ["CS", "ERR", "MPPT", "OR", "AR", "MON"])
 @pytest.mark.parametrize("failure", ["invalid", "missing", "read_failed"])
-def test_unavailable_status_never_keeps_display_value(monkeypatch, field, failure):
+def test_unavailable_status_never_keeps_previous_text(monkeypatch, field, failure):
     sensor, initial = reading(monkeypatch, {field: "0"})
-    assert initial["metrics"][0]["display_value"]
+    assert all(isinstance(value, str) for value in initial["data"].values())
 
     def acquire():
         if failure == "read_failed":
@@ -102,20 +99,18 @@ def test_unavailable_status_never_keeps_display_value(monkeypatch, field, failur
 
     monkeypatch.setattr(sensor, "_read_serial", acquire)
     result = sensor.read()
-    descriptor = result["metrics"][0]
-    assert not descriptor["available"]
-    assert descriptor["reason"] == failure
-    assert "display_value" not in descriptor
-    assert "charge_state" not in result["data"]
+    assert "metrics" not in result
+    assert all(value is None for value in result["data"].values())
+    assert result["ok"] == (failure != "read_failed")
+    if failure != "invalid":
+        assert result["data"] == {}
 
 
 @pytest.mark.parametrize("field", ["CS", "ERR", "MPPT", "AR"])
 def test_negative_unsigned_status_is_invalid(monkeypatch, field):
     _, result = reading(monkeypatch, {field: "-1"})
-    descriptor = result["metrics"][0]
-    assert result["data"][descriptor["data_key"]] is None
-    assert not descriptor["available"]
-    assert "display_value" not in descriptor
+    assert list(result["data"].values()) == [None]
+    assert "metrics" not in result
 
 
 def test_day_sequence_and_flags_are_not_display_strings(monkeypatch):
@@ -126,7 +121,7 @@ def test_day_sequence_and_flags_are_not_display_strings(monkeypatch):
         "relay": False,
         "alarm": False,
     }
-    assert all("display_value" not in metric for metric in result["metrics"])
+    assert "metrics" not in result
 
 
 @pytest.mark.parametrize(
@@ -164,6 +159,7 @@ def test_day_sequence_and_flags_are_not_display_strings(monkeypatch):
 )
 def test_masks_preserve_every_active_reason_and_unknown_bits(monkeypatch, field, raw, code, label):
     _, result = reading(monkeypatch, {field: raw})
-    descriptor = result["metrics"][0]
-    assert descriptor["display_value"] == label
-    assert result["data"] == {descriptor["data_key"]: code}
+    key = {"OR": "off_reason", "AR": "alarm_reason"}[field]
+    assert result["data"] == {key: label}
+    assert normalize({field: raw}) == {key: code}
+    assert "metrics" not in result

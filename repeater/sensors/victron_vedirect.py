@@ -137,7 +137,7 @@ CHARGE_STATES = {
 }
 
 
-# Protocol 3.34, pp. 15–16. Keep numeric data for storage/API consumers.
+# Protocol 3.34, pp. 15–16. Decode statuses inside this drop-in sensor.
 ENUM_VALUES = {
     "CS": CHARGE_STATES,
     "ERR": {
@@ -184,14 +184,7 @@ ENUM_VALUES = {
         8: "Water heater",
     },
 }
-STATUS_LABELS = {
-    "CS": "State of operation",
-    "ERR": "Error code",
-    "MPPT": "Tracker operation mode",
-    "MON": "DC monitor mode",
-    "OR": "Off reason",
-    "AR": "Alarm reason",
-}
+
 
 # Protocol 3.34, p. 11: OR is hexadecimal; AR is decimal, both additive masks.
 MASK_VALUES = {
@@ -307,48 +300,10 @@ class VictronVEDirectSensor(SensorBase):
             raise ValueError("read_timeout_seconds must be between 0.05 and 2.0") from None
         if isinstance(raw_timeout, bool) or not 0.05 <= self.read_timeout_seconds <= 2.0:
             raise ValueError("read_timeout_seconds must be between 0.05 and 2.0")
-        self._seen = set()
-        self._data = {}
-
-    def _reading_metrics(self, ok):
-        metrics = []
-        for label in sorted(self._seen):
-            key, divisor, unit = FIELDS[label]
-            available = ok and self._data.get(key) is not None
-            metrics.append(
-                {
-                    "id": "/" + label,
-                    "source_path": "/" + label,
-                    "data_key": key,
-                    "label": STATUS_LABELS.get(label, key.replace("_", " ").title()),
-                    "unit": unit,
-                    "kind": "boolean" if divisor is None else "number",
-                    "category": "status" if unit is None else "measurement",
-                    "available": available,
-                    **(
-                        {"display_value": status_display_value(label, self._data[key])}
-                        if available and label in STATUS_LABELS
-                        else {}
-                    ),
-                    **(
-                        {
-                            "reason": "read_failed"
-                            if not ok
-                            else "invalid"
-                            if key in self._data
-                            else "missing"
-                        }
-                        if not available
-                        else {}
-                    ),
-                }
-            )
-        return metrics
 
     def _read(self):
-        self._data = {}
         try:
-            self._data = self._read_serial()
+            data = self._read_serial()
         except ImportError:
             raise RuntimeError(
                 "pyserial unavailable; install pyserial in the service environment"
@@ -357,7 +312,21 @@ class VictronVEDirectSensor(SensorBase):
             raise RuntimeError(
                 "VE.Direct serial transport unavailable; check device and permissions"
             ) from None
-        return self._data
+        # Existing UIs display flat strings. Do not publish descriptor-only text
+        # or duplicate raw status keys that need a companion UI upgrade.
+        for label, output_key in {
+            "CS": "charge_state",
+            "ERR": "error",
+            "MPPT": "tracker_state",
+            "MON": "monitor_mode",
+            "OR": "off_reason",
+            "AR": "alarm_reason",
+        }.items():
+            raw_key = FIELDS[label][0]
+            if raw_key in data:
+                value = data.pop(raw_key)
+                data[output_key] = status_display_value(label, value) if value is not None else None
+        return data
 
     def _read_serial(self):
         serial = importlib.import_module("serial")
@@ -385,7 +354,6 @@ class VictronVEDirectSensor(SensorBase):
                 frames = parser.feed(payload)
                 for fields in frames:
                     received_frame = True
-                    self._seen.update(set(fields) & FIELDS.keys())
                     data.update(normalize(fields))
         if received_frame:
             return data
