@@ -12,7 +12,7 @@ Install into the **same Python environment used by the service**, not an unrelat
 sudo /opt/openhop_repeater/venv/bin/python -m pip install pyserial
 ```
 
-The standard package already declares pyserial; this command is useful for minimal/custom installations. Import and type discovery remain safe without it: reads report unavailable and never invoke runtime pip, even if global sensor auto-install is enabled.
+The standard package already declares pyserial; this command is useful for minimal/custom installations. The sensor now uses `SensorBase.ensure_python_modules` during initialization, respecting the per-sensor/global `auto_install_packages` setting. If disabled, missing pyserial leaves the sensor unavailable; if enabled, the standard helper may install it during initialization. Type discovery remains safe without pyserial and never installs packages. Polling never runs pip or repeats dependency checks. Restart/reload the backend after resolving an initialization-time dependency failure.
 
 On Raspberry Pi OS/Debian, check the device's ownership and grant the actual service account access to its group (normally `dialout`):
 
@@ -100,7 +100,7 @@ Fields depend on model, firmware and configured auxiliary input. This table desc
 
 ### Calculated load power
 
-VE.Direct does not provide a direct load-power field here. When both battery voltage and load current are valid in the current poll, the sensor calculates `load_power_w = battery_voltage_v * load_current_a` after merging that poll's validated blocks. This is an estimate using battery voltage, not a separately measured power value. Zero is a valid result and the current's sign is preserved. Missing or invalid inputs never reuse a previous value; a previously discovered calculated card becomes unavailable with the corresponding reason. Its descriptor uses `/derived/load_power_w` to identify a calculated local field, not a wire-protocol label. No UI or configuration change is required, and the existing V1 grouping remains intact.
+VE.Direct does not provide a direct load-power field here. When both battery voltage and load current are valid in the current poll, the sensor calculates `load_power_w = battery_voltage_v * load_current_a` after merging that poll's validated blocks. This is an estimate using battery voltage, not a separately measured power value. Zero is a valid result and the current's sign is preserved. The calculated product is rounded to six decimal places, matching millivolt × milliamp input resolution and removing binary floating-point tails without adding trailing zeros. Missing or invalid inputs never reuse a previous value; a previously discovered calculated card becomes unavailable with the corresponding reason. Its descriptor uses `/derived/load_power_w` to identify a calculated local field, not a wire-protocol label. No UI or configuration change is required, and the existing V1 grouping remains intact.
 
 ### Readable status values — sensor only
 

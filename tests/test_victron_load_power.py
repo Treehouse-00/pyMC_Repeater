@@ -110,6 +110,16 @@ def test_load_power_never_combines_inputs_from_different_polls(monkeypatch):
         assert all(metric["data_key"] != "load_power_w" for metric in result["metrics"])
 
 
+@pytest.mark.parametrize("current,expected", [(200, 2.698), (-200, -2.698), (1, 0.01349)])
+def test_load_power_removes_float_noise_without_losing_input_precision(
+    monkeypatch, current, expected
+):
+    serial_port(monkeypatch, frame({"V": 13490, "IL": current}))
+    result = manager().read_all()[0]
+    # Exact comparison: approximate comparisons hide the reported rendering bug.
+    assert result["data"]["load_power_w"] == expected
+
+
 def test_load_power_does_not_use_value_invalidated_later_in_same_poll(monkeypatch):
     serial_port(monkeypatch, frame({"V": 12800, "IL": 1500}) + frame({"IL": "---"}))
     result = manager().read_all()[0]

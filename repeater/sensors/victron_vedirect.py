@@ -304,6 +304,14 @@ class VictronVEDirectSensor(SensorBase):
         self._seen = set()
         self._data = {}
         self._load_power_seen = False
+        self._serial = None
+        if self.ensure_python_modules([("serial", "pyserial")]):
+            try:
+                self._serial = importlib.import_module("serial")
+            except ImportError:
+                self.log.warning(
+                    "pyserial unavailable; install pyserial in the service environment"
+                )
 
     def _reading_metrics(self, ok):
         metrics = []
@@ -360,6 +368,8 @@ class VictronVEDirectSensor(SensorBase):
 
     def _read(self):
         self._data = {}
+        if self._serial is None:
+            raise RuntimeError("pyserial unavailable; install pyserial in the service environment")
         try:
             self._data = self._read_serial()
         except ImportError:
@@ -375,13 +385,14 @@ class VictronVEDirectSensor(SensorBase):
             self._load_power_seen = True
             voltage = self._data["battery_voltage_v"]
             current = self._data["load_current_a"]
+            # mV × mA resolves to micro-watts; discard only binary float noise.
             self._data["load_power_w"] = (
-                voltage * current if voltage is not None and current is not None else None
+                round(voltage * current, 6) if voltage is not None and current is not None else None
             )
         return self._data
 
     def _read_serial(self):
-        serial = importlib.import_module("serial")
+        serial = self._serial
         deadline = time.monotonic() + self.read_timeout_seconds
         parser = VEDirectParser()
         data = {}
