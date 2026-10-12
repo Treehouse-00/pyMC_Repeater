@@ -5811,7 +5811,7 @@ components:
       properties:
         id:
           type: string
-          description: RFC6901 JSON Pointer relative to the modem stats response.
+          description: RFC6901 JSON Pointer relative to the plugin's source field mapping (modem stats JSON or parsed VE.Direct text labels).
         source_path:
           type: string
         data_key:

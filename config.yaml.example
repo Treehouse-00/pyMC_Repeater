@@ -267,6 +267,17 @@ sensors:
       name: system-health
       enabled: true
 
+    # Read-only Victron VE.Direct USB telemetry; see docs/victron_vedirect.md.
+    # Install pyserial in the service environment; no runtime pip for this sensor.
+    # Stop cat/other serial readers before enabling. Unique name per device.
+    # - type: victron_vedirect
+    #   name: solar-charger
+    #   enabled: true
+    #   auto_install_packages: false
+    #   settings:
+    #     serial_device: "/dev/serial/by-id/REPLACE_WITH_YOUR_ADAPTER"
+    #     read_timeout_seconds: 1.5  # 0.05–2.0; each poll opens/reads/closes
+
     # Example INA219 sensor (commented out by default)
     # - type: ina219
     #   name: power-monitor
