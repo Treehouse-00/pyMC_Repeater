@@ -117,6 +117,26 @@ FIELDS = {
 }
 
 
+# Protocol 3.34, p. 15: CS state of operation. Product families emit subsets.
+CHARGE_STATES = {
+    0: "Off",
+    1: "Low power",
+    2: "Fault",
+    3: "Bulk",
+    4: "Absorption",
+    5: "Float",
+    6: "Storage",
+    7: "Equalize (manual)",
+    9: "Inverting",
+    11: "Power supply",
+    245: "Starting-up",
+    246: "Repeated absorption",
+    247: "Auto equalize / Recondition",
+    248: "BatterySafe",
+    252: "External Control",
+}
+
+
 def normalize(fields):
     data = {}
     for label, (key, divisor, _) in FIELDS.items():
@@ -139,6 +159,11 @@ def normalize(fields):
             ):
                 continue
             data[key] = value if divisor == 1 else value / divisor
+    if "charge_state_code" in data:
+        code = data["charge_state_code"]
+        data["charge_state"] = (
+            CHARGE_STATES.get(code, f"Unknown ({code})") if code is not None else None
+        )
     return data
 
 

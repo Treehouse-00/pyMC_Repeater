@@ -86,7 +86,6 @@ def manager(device="/dev/ttyUSB-test", **settings):
         ("VPV", "18600", "pv_voltage_v", 18.6),
         ("PPV", "234", "pv_power_w", 234),
         ("IL", "1500", "load_current_a", 1.5),
-        ("CS", "3", "charge_state_code", 3),
         ("ERR", "17", "error_code", 17),
         ("MPPT", "2", "tracker_state_code", 2),
         ("HSDS", "364", "day_sequence", 364),
@@ -426,3 +425,46 @@ def test_manager_reads_normalized_battery_without_writing(monkeypatch):
     assert kwargs["parity"] == "N"
     assert kwargs["stopbits"] == 1
     assert not kwargs["xonxoff"] and not kwargs["rtscts"] and not kwargs["dsrdtr"]
+
+
+@pytest.mark.parametrize(
+    "code,label",
+    [
+        (0, "Off"),
+        (1, "Low power"),
+        (2, "Fault"),
+        (3, "Bulk"),
+        (4, "Absorption"),
+        (5, "Float"),
+        (6, "Storage"),
+        (7, "Equalize (manual)"),
+        (9, "Inverting"),
+        (11, "Power supply"),
+        (245, "Starting-up"),
+        (246, "Repeated absorption"),
+        (247, "Auto equalize / Recondition"),
+        (248, "BatterySafe"),
+        (252, "External Control"),
+        (999, "Unknown (999)"),
+    ],
+)
+def test_manager_charge_state_label_preserves_code(monkeypatch, code, label):
+    import serial
+
+    port = MagicMock()
+    port.__enter__.return_value = port
+    port.read.return_value = frame({"CS": code})
+    monkeypatch.setattr(serial, "Serial", MagicMock(return_value=port))
+    reading = manager().read_all()[0]
+    assert reading["ok"]
+    assert reading["data"] == {"charge_state_code": code, "charge_state": label}
+
+
+@pytest.mark.parametrize(
+    "fields,expected",
+    [({}, {}), ({"CS": "---"}, {"charge_state_code": None, "charge_state": None})],
+)
+def test_charge_state_label_missing_or_invalid_is_unavailable(fields, expected):
+    from repeater.sensors.victron_vedirect import normalize
+
+    assert normalize(fields) == expected
