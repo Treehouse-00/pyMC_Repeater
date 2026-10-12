@@ -301,9 +301,45 @@ class VictronVEDirectSensor(SensorBase):
         if isinstance(raw_timeout, bool) or not 0.05 <= self.read_timeout_seconds <= 2.0:
             raise ValueError("read_timeout_seconds must be between 0.05 and 2.0")
 
+        self._seen = set()
+        self._data = {}
+
+    def _reading_metrics(self, ok):
+        metrics = []
+        for field in sorted(self._seen):
+            key, divisor, unit = FIELDS[field]
+            available = ok and self._data.get(key) is not None
+            label = {
+                "CS": "Charge state",
+                "ERR": "Error",
+                "MPPT": "Tracker state",
+                "MON": "Monitor mode",
+                "OR": "Off reason",
+                "AR": "Alarm reason",
+            }.get(field, key.replace("_", " ").title())
+            if available and (field in ENUM_VALUES or field in MASK_VALUES):
+                label = f"{label} — {status_display_value(field, self._data[key])}"
+            descriptor = {
+                "id": "/" + field,
+                "source_path": "/" + field,
+                "data_key": key,
+                "label": label,
+                "unit": unit,
+                "kind": "boolean" if divisor is None else "number",
+                "category": "status" if unit is None else "measurement",
+                "available": available,
+            }
+            if not available:
+                descriptor["reason"] = (
+                    "read_failed" if not ok else "invalid" if key in self._data else "missing"
+                )
+            metrics.append(descriptor)
+        return metrics
+
     def _read(self):
+        self._data = {}
         try:
-            data = self._read_serial()
+            self._data = self._read_serial()
         except ImportError:
             raise RuntimeError(
                 "pyserial unavailable; install pyserial in the service environment"
@@ -312,21 +348,7 @@ class VictronVEDirectSensor(SensorBase):
             raise RuntimeError(
                 "VE.Direct serial transport unavailable; check device and permissions"
             ) from None
-        # Existing UIs display flat strings. Do not publish descriptor-only text
-        # or duplicate raw status keys that need a companion UI upgrade.
-        for label, output_key in {
-            "CS": "charge_state",
-            "ERR": "error",
-            "MPPT": "tracker_state",
-            "MON": "monitor_mode",
-            "OR": "off_reason",
-            "AR": "alarm_reason",
-        }.items():
-            raw_key = FIELDS[label][0]
-            if raw_key in data:
-                value = data.pop(raw_key)
-                data[output_key] = status_display_value(label, value) if value is not None else None
-        return data
+        return self._data
 
     def _read_serial(self):
         serial = importlib.import_module("serial")
@@ -354,6 +376,7 @@ class VictronVEDirectSensor(SensorBase):
                 frames = parser.feed(payload)
                 for fields in frames:
                     received_frame = True
+                    self._seen.update(set(fields) & FIELDS.keys())
                     data.update(normalize(fields))
         if received_frame:
             return data
