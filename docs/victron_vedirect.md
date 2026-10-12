@@ -82,6 +82,7 @@ Fields depend on model, firmware and configured auxiliary input. This table desc
 |---|---|---|
 | `V`, `I` | `battery_voltage_v`, `battery_current_a` | mV→V, mA→A; current sign preserved |
 | `VPV`, `PPV`, `IL` | `pv_voltage_v`, `pv_power_w`, `load_current_a` | mV→V, W, mA→A |
+| Calculated from `V` and `IL` | `load_power_w` | Battery voltage (V) × load current (A) → W; **Load power (calculated)** in Measurements |
 | `CS`, `ERR`, `MPPT` | `charge_state_code`, `error_code`, `tracker_state_code` | Numeric codes; official descriptions in the corresponding card labels |
 | `LOAD`, `Relay`, `Alarm` | `load_output`, `relay`, `alarm` | Case-insensitive ON/OFF→boolean; other values unavailable |
 | `AR`, `OR`, `MON` | `alarm_reason`, `off_reason`, `monitor_mode_code` | Decimal alarm mask, hexadecimal off mask, signed monitor mode; decoded wording in card labels |
@@ -96,6 +97,10 @@ Fields depend on model, firmware and configured auxiliary input. This table desc
 | `H21`, `H23`, `HSDS` | `max_power_today_w`, `max_power_yesterday_w`, `day_sequence` | W, W, day sequence 0–364 |
 
 `H17/H18` mean discharged/charged energy for a BMV, but produced/consumed energy in DC monitor mode; their keys intentionally avoid assigning a meaning that requires knowing the mode. `MON` is available only on supporting firmware. `SOC` outside 0–1000 per-mille and `HSDS` outside 0–364 are treated as invalid. Negative unsigned status codes/masks are invalid; `MON` remains signed.
+
+### Calculated load power
+
+VE.Direct does not provide a direct load-power field here. When both battery voltage and load current are valid in the current poll, the sensor calculates `load_power_w = battery_voltage_v * load_current_a` after merging that poll's validated blocks. This is an estimate using battery voltage, not a separately measured power value. Zero is a valid result and the current's sign is preserved. Missing or invalid inputs never reuse a previous value; a previously discovered calculated card becomes unavailable with the corresponding reason. Its descriptor uses `/derived/load_power_w` to identify a calculated local field, not a wire-protocol label. No UI or configuration change is required, and the existing V1 grouping remains intact.
 
 ### Readable status values — sensor only
 

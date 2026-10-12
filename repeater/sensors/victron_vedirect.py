@@ -303,6 +303,7 @@ class VictronVEDirectSensor(SensorBase):
 
         self._seen = set()
         self._data = {}
+        self._load_power_seen = False
 
     def _reading_metrics(self, ok):
         metrics = []
@@ -334,6 +335,27 @@ class VictronVEDirectSensor(SensorBase):
                     "read_failed" if not ok else "invalid" if key in self._data else "missing"
                 )
             metrics.append(descriptor)
+        if self._load_power_seen:
+            available = ok and self._data.get("load_power_w") is not None
+            descriptor = {
+                "id": "/derived/load_power_w",
+                "source_path": "/derived/load_power_w",
+                "data_key": "load_power_w",
+                "label": "Load power (calculated)",
+                "unit": "W",
+                "kind": "number",
+                "category": "measurement",
+                "available": available,
+            }
+            if not available:
+                descriptor["reason"] = (
+                    "read_failed"
+                    if not ok
+                    else "invalid"
+                    if "load_power_w" in self._data
+                    else "missing"
+                )
+            metrics.append(descriptor)
         return metrics
 
     def _read(self):
@@ -348,6 +370,14 @@ class VictronVEDirectSensor(SensorBase):
             raise RuntimeError(
                 "VE.Direct serial transport unavailable; check device and permissions"
             ) from None
+        # Derived after merging this poll's validated blocks, never across polls.
+        if "battery_voltage_v" in self._data and "load_current_a" in self._data:
+            self._load_power_seen = True
+            voltage = self._data["battery_voltage_v"]
+            current = self._data["load_current_a"]
+            self._data["load_power_w"] = (
+                voltage * current if voltage is not None and current is not None else None
+            )
         return self._data
 
     def _read_serial(self):
