@@ -9,6 +9,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from repeater.sensors.manager import SensorManager
+
 
 @pytest.mark.parametrize("checksum", range(256))
 def test_parser_fragmented_binary_checksum_and_resynchronization(checksum):
@@ -35,9 +37,6 @@ def test_parser_fragmented_binary_checksum_and_resynchronization(checksum):
     for byte in stream:
         found.extend(parser.feed(bytes([byte])))
     assert found == [{"V": "12800", "X": base["X"]}]
-
-
-from repeater.sensors.manager import SensorManager
 
 
 def frame(fields):
@@ -457,12 +456,16 @@ def test_manager_charge_state_label_preserves_code(monkeypatch, code, label):
     monkeypatch.setattr(serial, "Serial", MagicMock(return_value=port))
     reading = manager().read_all()[0]
     assert reading["ok"]
-    assert reading["data"] == {"charge_state_code": code, "charge_state": label}
+    assert reading["data"] == {"charge_state_code": code}
+    descriptor = reading["metrics"][0]
+    assert descriptor["display_value"] == label
+    assert descriptor["label"] == "State of operation"
+    assert descriptor["kind"] == "number"
 
 
 @pytest.mark.parametrize(
     "fields,expected",
-    [({}, {}), ({"CS": "---"}, {"charge_state_code": None, "charge_state": None})],
+    [({}, {}), ({"CS": "---"}, {"charge_state_code": None})],
 )
 def test_charge_state_label_missing_or_invalid_is_unavailable(fields, expected):
     from repeater.sensors.victron_vedirect import normalize

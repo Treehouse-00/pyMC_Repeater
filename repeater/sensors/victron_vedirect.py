@@ -137,6 +137,108 @@ CHARGE_STATES = {
 }
 
 
+# Protocol 3.34, pp. 15–16. Keep numeric data for storage/API consumers.
+ENUM_VALUES = {
+    "CS": CHARGE_STATES,
+    "ERR": {
+        0: "No error",
+        2: "Battery voltage too high",
+        17: "Charger temperature too high",
+        18: "Charger over current",
+        19: "Charger current reversed",
+        20: "Bulk time limit exceeded",
+        21: "Current sensor issue (sensor bias/sensor broken)",
+        26: "Terminals overheated",
+        28: "Converter issue (dual converter models only)",
+        33: "Input voltage too high (solar panel)",
+        34: "Input current too high (solar panel)",
+        38: "Input shutdown (due to excessive battery voltage)",
+        39: "Input shutdown (due to current flow during off mode)",
+        65: "Lost communication with one of devices",
+        66: "Synchronised charging device configuration issue",
+        67: "BMS connection lost",
+        68: "Network misconfigured",
+        116: "Factory calibration data lost",
+        117: "Invalid/incompatible firmware",
+        119: "User settings invalid",
+    },
+    "MPPT": {0: "Off", 1: "Voltage or current limited", 2: "MPP Tracker active"},
+    "MON": {
+        -9: "Solar charger",
+        -8: "Wind turbine",
+        -7: "Shaft generator",
+        -6: "Alternator",
+        -5: "Fuel cell",
+        -4: "Water generator",
+        -3: "DC/DC charger",
+        -2: "AC charger",
+        -1: "Generic source",
+        0: "Battery monitor (BMV)",
+        1: "Generic load",
+        2: "Electric drive",
+        3: "Fridge",
+        4: "Water pump",
+        5: "Bilge pump",
+        6: "DC system",
+        7: "Inverter",
+        8: "Water heater",
+    },
+}
+STATUS_LABELS = {
+    "CS": "State of operation",
+    "ERR": "Error code",
+    "MPPT": "Tracker operation mode",
+    "MON": "DC monitor mode",
+    "OR": "Off reason",
+    "AR": "Alarm reason",
+}
+
+# Protocol 3.34, p. 11: OR is hexadecimal; AR is decimal, both additive masks.
+MASK_VALUES = {
+    "OR": {
+        1: "No input power",
+        2: "Switched off (power switch)",
+        4: "Switched off (device mode register)",
+        8: "Remote input",
+        16: "Protection active",
+        32: "Paygo",
+        64: "BMS",
+        128: "Engine shutdown detection",
+        256: "Analysing input voltage",
+    },
+    "AR": {
+        1: "Low Voltage",
+        2: "High Voltage",
+        4: "Low SOC",
+        8: "Low Starter Voltage",
+        16: "High Starter Voltage",
+        32: "Low Temperature",
+        64: "High Temperature",
+        128: "Mid Voltage",
+        256: "Overload",
+        512: "DC-ripple",
+        1024: "Low V AC out",
+        2048: "High V AC out",
+        4096: "Short Circuit",
+        8192: "BMS Lockout",
+    },
+}
+
+
+def status_display_value(label, value):
+    if label in ENUM_VALUES:
+        return ENUM_VALUES[label].get(value, f"Unknown ({value})")
+    reasons = []
+    unknown = value
+    for bit, text in MASK_VALUES[label].items():
+        if value & bit:
+            reasons.append(text)
+            unknown &= ~bit
+    if unknown:
+        reasons.append(f"Unknown bits (0x{unknown:X})")
+    return "; ".join(reasons) if reasons else "None"
+
+
 def normalize(fields):
     data = {}
     for label, (key, divisor, _) in FIELDS.items():
@@ -153,17 +255,13 @@ def normalize(fields):
                 continue
             value = int(raw, 16 if label == "OR" else 10)
             if (
-                (label == "TTG" and value < 0)
+                (label in {"CS", "ERR", "MPPT", "AR"} and value < 0)
+                or (label == "TTG" and value < 0)
                 or (label == "SOC" and not 0 <= value <= 1000)
                 or (label == "HSDS" and not 0 <= value <= 364)
             ):
                 continue
             data[key] = value if divisor == 1 else value / divisor
-    if "charge_state_code" in data:
-        code = data["charge_state_code"]
-        data["charge_state"] = (
-            CHARGE_STATES.get(code, f"Unknown ({code})") if code is not None else None
-        )
     return data
 
 
@@ -222,11 +320,16 @@ class VictronVEDirectSensor(SensorBase):
                     "id": "/" + label,
                     "source_path": "/" + label,
                     "data_key": key,
-                    "label": key.replace("_", " ").title(),
+                    "label": STATUS_LABELS.get(label, key.replace("_", " ").title()),
                     "unit": unit,
                     "kind": "boolean" if divisor is None else "number",
                     "category": "status" if unit is None else "measurement",
                     "available": available,
+                    **(
+                        {"display_value": status_display_value(label, self._data[key])}
+                        if available and label in STATUS_LABELS
+                        else {}
+                    ),
                     **(
                         {
                             "reason": "read_failed"

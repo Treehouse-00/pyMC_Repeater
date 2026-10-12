@@ -5830,6 +5830,10 @@ components:
           enum: [measurement, diagnostic, configuration, status]
         available:
           type: boolean
+        display_value:
+          type: string
+          minLength: 1
+          description: Optional human-readable display text from this snapshot, replacing raw-value formatting only when available is true and the data_key value is valid for kind. Omit for unavailable metrics. Does not change numeric/boolean data or storage; unknown codes and bits must remain explicit in this text.
         reason:
           type: string
           enum: ['null', missing, source_unavailable, invalid, read_failed]

@@ -95,7 +95,20 @@ Fields depend on model, firmware and configured auxiliary input. This table desc
 | `H19`, `H20`, `H22` | `yield_total_kwh`, `yield_today_kwh`, `yield_yesterday_kwh` | 0.01 kWh→kWh; total is user-resettable |
 | `H21`, `H23`, `HSDS` | `max_power_today_w`, `max_power_yesterday_w`, `day_sequence` | W, W, day sequence 0–364 |
 
-`H17/H18` mean discharged/charged energy for a BMV, but produced/consumed energy in DC monitor mode; their keys intentionally avoid assigning a meaning that requires knowing the mode. `MON` is available only on supporting firmware. `SOC` outside 0–1000 per-mille and `HSDS` outside 0–364 are treated as invalid. Unknown numeric CS/ERR codes are retained for forward compatibility. `charge_state` additionally translates `CS` using the official protocol's state-of-operation table (p. 15), including Bulk, Absorption and Float. Unrecognized codes display `Unknown (code)`; an invalid state is unavailable. The numeric `charge_state_code` remains unchanged. This text field is included in flat data, not the number/boolean metric-descriptor list; current dashboards can show it in **Legacy values** alongside the numeric status metric.
+`H17/H18` mean discharged/charged energy for a BMV, but produced/consumed energy in DC monitor mode; their keys intentionally avoid assigning a meaning that requires knowing the mode. `MON` is available only on supporting firmware. `SOC` outside 0–1000 per-mille and `HSDS` outside 0–364 are treated as invalid. Negative unsigned status codes/masks are invalid; `MON` remains signed.
+
+### Readable Status cards
+
+Raw numeric codes and masks remain unchanged in flat `data` for API/storage consumers. The corresponding descriptor carries optional `display_value` text, rendered directly in the existing **Status** card by compatible RepeaterUI versions. There is no extra flat `charge_state` string or duplicate **Legacy values** entry. Older UIs safely retain numeric status rendering.
+
+- `CS`: official state of operation (p. 15), e.g. `3` → **Bulk**.
+- `ERR`: official error code (p. 15), e.g. `0` → **No error**.
+- `MPPT`: tracker operation (p. 16), e.g. `2` → **MPP Tracker active**.
+- `MON`: signed DC monitor mode (p. 16), e.g. `-9` → **Solar charger**.
+- `OR`: hexadecimal off-reason mask (p. 11), e.g. `0x9` → **No input power; Remote input**.
+- `AR`: decimal alarm-reason mask (p. 11), e.g. `5` → **Low Voltage; Low SOC**.
+
+Unknown enum values remain explicit as **Unknown (code)**. All active mask reasons are shown; unrecognized bits are appended as **Unknown bits (0xHEX)**, not silently discarded. A zero reason mask displays **None**, meaning no reason bits are set (not an inference about device health). Missing, invalid or failed readings omit `display_value` and show **n/a**, never the previous label. `day_sequence` remains numeric and LOAD/Relay/Alarm remain booleans. These interpretations follow the protocol, not a guessed physical model.
 
 For MPPT 75/15 and 100/15, firmware 1.14 and earlier reports converter output current in `I`, not necessarily current into the battery. Protocol Table I footnote 5 documents the distinction. This plug-in preserves the reported current; confirm firmware before treating that key as battery current on older models.
 
@@ -110,7 +123,7 @@ Source: [Victron VE.Direct Protocol 3.34](https://www.victronenergy.com/upload/d
 | p. 5, **Message format**, **Data integrity**: CRLF/label/tab/value, binary single-byte Checksum, modulo-256 sum=0, multiple blocks | Incremental binary parser; all 256 checksum byte values, corruption/resync and multiple-block polling tests |
 | pp. 6–9, **Fields**, **Table I Supported Text-mode fields** | Explicit `FIELDS` conversion allowlist and parameterized real-manager normalization tests |
 | p. 6 footnotes 8–11; p. 7 footnote 12 | `---` invalid/unsynchronized/unsupported values and infinite `TTG=-1` tests |
-| pp. 10–11, **I**, **Alarm**, **Relay**, **AR**, **OR**; pp. 14–16, **CS**, **ERR**, **HSDS**, **MPPT**, **MON** | Preserve current sign and numeric states/masks; case-insensitive flags; no fabricated model fields |
+| pp. 10–11, **I**, **Alarm**, **Relay**, **AR**, **OR**; pp. 15–16, **CS**, **ERR**, **HSDS**, **MPPT**, **MON** | Preserve raw current sign and numeric states/masks; official descriptor display text for all enum values and mask bits, unknown codes/bits and multi-reason tests in `tests/test_victron_status.py`; case-insensitive flags; no fabricated model fields |
 | p. 17, **Implementation guidelines** | 8/32 character field payload bounds, 22 temporary data fields, validation before publication; bounded noise/malformed fixtures |
 | `SensorBase.read/_reading_metrics`, registry decorator, `SensorManager.reload/read_all`, `APIEndpoints.sensors_types`, OpenAPI `SensorMetricDescriptor` | Real manager and settings-discovery tests; no new lifecycle hooks; metadata conforms to the existing optional contract |
 
