@@ -181,6 +181,7 @@ Limits per modem: response 128 KiB, dictionary depth four below a root, 512 insp
 
 | Type | File | Hardware |
 |------|------|----------|
+| `victron_vedirect` | `repeater/sensors/victron_vedirect.py` | Read-only local Victron VE.Direct serial text telemetry; [setup and field units](victron_vedirect.md) |
 | `hardware_stats` | `repeater/sensors/hardware_stats.py` | Host CPU / memory / disk / network (via `psutil`) |
 | `ina219` | `repeater/sensors/ina219.py` | INA219 I²C current/voltage/power monitor |
 | `ens210` | `repeater/sensors/ens210.py` | ENS210 I²C relative humidity and temperature sensor |
